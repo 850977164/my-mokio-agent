@@ -13,7 +13,11 @@ __pycache__/
 dist/
 
 # 工作区目录（运行时产物）
+.mokioclaw/
 workspace/
+
+# Claude Code 本地配置
+.claude/
 
 # uv 锁文件（库项目通常忽略，应用项目可以保留；视你需求调整）
 # uv.lock

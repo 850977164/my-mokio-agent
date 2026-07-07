@@ -31,3 +31,22 @@ def build_tools(state: RuntimeState) -> list[StructuredTool]:
         create_grep_tool(workspace=workspace),
         create_bash_tool(workspace=workspace),
     ]
+
+
+def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
+    """构建只读工具列表（FileRead + Grep），供 Verifier 使用。
+
+    Verifier 只需要检查文件内容和搜索结果，不允许修改文件或执行命令。
+
+    Args:
+        state: 当前运行时状态。
+
+    Returns:
+        包含 FileRead 和 Grep 的 StructuredTool 列表。
+    """
+    workspace = state.workspace
+
+    return [
+        create_file_read_tool(workspace=workspace),
+        create_grep_tool(workspace=workspace),
+    ]
