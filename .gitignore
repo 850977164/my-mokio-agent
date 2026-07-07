@@ -1,0 +1,19 @@
+# 环境变量（含 API Key，绝对不能提交）
+.env
+
+# IDE 配置
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+
+# 工作区目录（运行时产物）
+workspace/
+
+# uv 锁文件（库项目通常忽略，应用项目可以保留；视你需求调整）
+# uv.lock

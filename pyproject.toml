@@ -1,0 +1,32 @@
+[project]
+name = "mokioclaw"
+version = "0.1.0"
+description = "Mokio Agent 智能调度代理项目"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain>=1.2.15",
+    "langchain-openai>=1.1.13",
+    "langgraph>=1.1.6",
+    "python-dotenv>=1.1.1",
+    "rich>=13.0.0",
+    "textual>=8.2.4",
+    "typer>=0.16.0",
+]
+
+# 脚本名称同步改成 mokioclaw
+[project.scripts]
+mokioclaw = "mokioclaw.cli.app:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mokioclaw"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
