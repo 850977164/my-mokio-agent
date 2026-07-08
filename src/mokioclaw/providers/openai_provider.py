@@ -48,6 +48,8 @@ def create_model(
         "model": model,
         "api_key": api_key,
         "temperature": temperature,
+        "max_retries": 2,
+        "request_timeout": 120,
     }
     if base_url:
         kwargs["base_url"] = base_url

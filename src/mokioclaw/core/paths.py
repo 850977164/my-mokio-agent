@@ -15,10 +15,34 @@ def resolve_workspace(workspace: str | Path | None) -> Path:
         解析后的绝对路径。
     """
     if workspace is None:
-        # 默认在项目根目录下创建 .mokioclaw/workspaces/<timestamp>
-        cwd = Path.cwd()
-        workspace = cwd / ".mokioclaw" / "workspaces" / "default"
+        cwd = Path.cwd().resolve()
+
+        # 如果 cwd 已经是某个 workspace 目录（包含 .mokioclaw 标记），
+        # 直接使用 cwd，避免路径嵌套。
+        if (cwd / ".mokioclaw").is_dir():
+            return cwd
+
+        # 查找项目根目录（往上找包含 pyproject.toml 或 .git 的目录）
+        project_root = _find_project_root(cwd)
+        workspace = project_root / ".mokioclaw" / "workspaces" / "default"
     return Path(workspace).resolve()
+
+
+def _find_project_root(start: Path) -> Path:
+    """从 start 开始向上查找项目根目录。
+
+    搜索标记: pyproject.toml 或 .git 目录。
+    """
+    current = start
+    for _ in range(10):  # 最多向上找 10 层
+        if (current / "pyproject.toml").is_file() or (current / ".git").is_dir():
+            return current
+        parent = current.parent
+        if parent == current:  # 已到文件系统根
+            break
+        current = parent
+    # 回退到 start 本身
+    return start
 
 
 def ensure_workspace(workspace: Path) -> Path:

@@ -1,15 +1,15 @@
 """LangGraph 图编译入口 —— MultiAgent 工作流.
 
-将 Planner / Verifier / Final 三个节点组装为状态图，
-Planner 通过工具调用委托 searchAgent 和 codeAgent:
+图结构（简单图）:
+    START → Planner → context_monitor → Verifier → context_monitor → Final → END
+                ↑                           │
+                └───────────────────────────┘ (monitor_route → "planner")
 
-    START → Planner → Verifier → Final → END
-                ↑          │
-                └──────────┘ (verifier_route → "planner")
+图结构（复杂图，含压缩）:
+    START → Planner → context_monitor ⇄ context_compressor → Verifier → Final → END
 
 Usage:
     from mokioclaw.graph.workflow import build_workflow
-
     graph = build_workflow()
     result = graph.invoke({"task": "...", "runtime": runtime, ...})
 """
@@ -21,7 +21,10 @@ from langgraph.graph import END, START, StateGraph
 from mokioclaw.graph.nodes import (
     planner_node,
     verifier_node,
-    verifier_route,
+    context_monitor_node,
+    context_monitor_route,
+    context_compressor_node,
+    context_compressor_route,
 )
 from mokioclaw.graph.state import MokioGraphState
 
@@ -144,7 +147,46 @@ def final_node(state: MokioGraphState) -> dict:
 
 
 def build_workflow():
-    """编译并返回 MultiAgent 工作流图.
+    """编译并返回 MultiAgent 工作流图（无上下文压缩）.
+
+    图结构:
+        START → Planner → context_monitor → Verifier → context_monitor → Final → END
+                    ↑                           │
+                    └───────────────────────────┘ (monitor_route → "planner")
+
+    Returns:
+        CompiledStateGraph: 已编译的 LangGraph 状态图，可直接 .invoke() 调用.
+    """
+    graph = StateGraph(MokioGraphState)
+    graph.add_node("planner", planner_node)
+    graph.add_node("context_monitor", context_monitor_node)
+    graph.add_node("verifier", verifier_node)
+    graph.add_node("final", final_node)
+
+    graph.add_edge(START, "planner")
+    graph.add_edge("planner", "context_monitor")
+    graph.add_conditional_edges("context_monitor", context_monitor_route, {
+        "context_compressor": "context_monitor",  # 无 compressor 时自循环
+        "verifier": "verifier",
+        "planner": "planner",
+        "final": "final",
+    })
+    graph.add_edge("verifier", "context_monitor")
+    graph.add_edge("final", END)
+    return graph.compile()
+
+
+def build_complex_workflow():
+    """编译并返回 MultiAgent 复合工作流图.
+
+    图结构:
+        START → Planner → context_monitor → context_compressor/Verifier → Final → END
+            ↑               ↑                   │            │
+            └───────────────┴───────────────────┘            │
+            (context_monitor_route → "planner")              │
+            (context_compressor_route → "verifier"/"planner")│
+            (verifier → context_monitor)                     │
+            └────────────────────────────────────────────────┘
 
     Returns:
         CompiledStateGraph: 已编译的 LangGraph 状态图，可直接 .invoke() 调用.
@@ -153,20 +195,39 @@ def build_workflow():
 
     # ── 注册节点 ──
     graph.add_node("planner", planner_node)
+    graph.add_node("context_monitor", context_monitor_node)
+    graph.add_node("context_compressor", context_compressor_node)
     graph.add_node("verifier", verifier_node)
     graph.add_node("final", final_node)
 
     # ── 连线 ──
     graph.add_edge(START, "planner")
-    graph.add_edge("planner", "verifier")
+    graph.add_edge("planner", "context_monitor")
+
+    # context_monitor 路由: passed → final | should_compress → context_compressor | 否则 → context_next_node
     graph.add_conditional_edges(
-        "verifier",
-        verifier_route,
+        "context_monitor",
+        context_monitor_route,
         {
-            "final": "final",
+            "context_compressor": "context_compressor",
+            "verifier": "verifier",
             "planner": "planner",
+            "final": "final",
         },
     )
+
+    # context_compressor 路由: 压缩后直接由 context_next_node 决定目标
+    graph.add_conditional_edges(
+        "context_compressor",
+        context_compressor_route,
+        {
+            "verifier": "verifier",
+            "planner": "planner",
+            "final": "final",
+        },
+    )
+
+    graph.add_edge("verifier", "context_monitor")  # 验证后也过 monitor
     graph.add_edge("final", END)
 
     return graph.compile()

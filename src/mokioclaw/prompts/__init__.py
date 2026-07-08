@@ -6,10 +6,12 @@ from mokioclaw.prompts.stage2 import (
     PLANNER_PROMPT,
     VERIFIER_PROMPT,
 )
+from mokioclaw.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 
 __all__ = [
     "PLANNER_PROMPT",
     "ACTOR_PROMPT",
     "VERIFIER_PROMPT",
     "FINAL_PROMPT",
+    "CONTEXT_COMPRESSION_PROMPT",
 ]

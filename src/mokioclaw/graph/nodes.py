@@ -1,37 +1,52 @@
-"""MultiAgent 图节点 —— Planner / Verifier 两节点实现.
+"""MultiAgent 图节点 — 完整上下文工程流水线.
 
-架构:
-    Planner ──→ Verifier ──→ Final (passed)
-        ↑            │
-        └────────────┘ (retry, up to max_attempts)
+架构（简单图）:
+    START → Planner → context_monitor → Verifier → context_monitor → Final → END
+        ↑                                    │
+        └────────────────────────────────────┘ (monitor_route → "planner"，retry)
 
-    Planner 通过工具调用委托任务:
-        - TodoWriteTool:     发布/修订计划
-        - CallSearchAgentTool: 委托搜索任务给 searchAgent
-        - CallCodeAgentTool:   委托实现任务给 codeAgent
+架构（复杂图，含压缩）:
+    START → Planner → context_monitor ⇄ context_compressor → Verifier → Final → END
 
-    Verifier: 检查成果是否满足验收标准，运行验证命令。
+Planner 通过工具调用委托任务:
+    - TodoWriteTool:         发布/修订计划 → 产出 plan_summary/todos/acceptance_criteria
+    - CallSearchAgentTool:   委托搜索任务给 searchAgent
+    - CallCodeAgentTool:     委托实现任务给 codeAgent
+
+Verifier: 运行验证命令 + LLM 只读检查 → ReportVerification 结构化判定
+
+context_monitor:   估算 token → 条件触发压缩
+context_compressor: LLM 压缩消息历史 → 换入精简摘要
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime, timezone
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
+from langgraph.graph.message import REMOVE_ALL_MESSAGES, RemoveMessage
 
 from mokioclaw.agents.code_agent import run_code_agent
 from mokioclaw.agents.search_agent import run_search_agent
 from mokioclaw.core.state import RuntimeState
 from mokioclaw.graph.state import (
     AgentHandoff,
+    CompressionEvent,
     MokioGraphState,
     SourceItem,
     TodoItem,
     VerificationResult,
 )
+from mokioclaw.graph.memory import (
+    build_layered_memory,
+    format_layered_memory_for_prompt,
+    memory_event,
+)
 from mokioclaw.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
+from mokioclaw.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools.registry import build_read_only_tools
 from mokioclaw.tools.structured_tools import (
@@ -125,7 +140,16 @@ def _make_call_code_agent_tool(state: MokioGraphState, writer) -> StructuredTool
         if writer is not None:
             writer(event)
 
-        result = run_code_agent(runtime, instruction, writer=writer)
+        # 构建分层 Memory 并发射事件
+        memory = build_layered_memory(state, node="codeAgent")
+        if writer is not None:
+            writer(memory_event(memory, node="codeAgent"))
+
+        result = run_code_agent(
+            runtime, instruction,
+            memory=memory,
+            writer=writer,
+        )
 
         # 更新 state 中的 code_agent_summary
         state["code_agent_summary"] = result.get("summary", "")
@@ -172,7 +196,61 @@ def _make_call_code_agent_tool(state: MokioGraphState, writer) -> StructuredTool
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Helpers
+# Node input builders — 将 state + memory 拼接为 HumanMessage
+# ═══════════════════════════════════════════════════════════════════════
+
+def _planner_input(state: MokioGraphState, memory: dict) -> str:
+    """构建 Planner 节点的 HumanMessage 内容."""
+    memory_text = format_layered_memory_for_prompt(memory)
+    existing_todos = state.get("todos", [])
+    if not existing_todos:
+        return (
+            f"## 用户任务\n{state['task']}\n\n"
+            f"## 分层记忆\n{memory_text}\n\n"
+            "请先用 TodoWrite 发布执行计划，然后根据需要调用 CallSearchAgent 搜索信息，"
+            "最后调用 CallCodeAgent 委托实现。"
+        )
+    research_notes = state.get("research_notes", "")
+    last_error = state.get("last_error", "")
+    return (
+        f"## 原始任务\n{state['task']}\n\n"
+        f"## 分层记忆\n{memory_text}\n\n"
+        f"## 当前计划\n{_format_todos(existing_todos)}\n\n"
+        f"## 验收标准\n"
+        + "\n".join(f"  - {c}" for c in state.get("acceptance_criteria", []))
+        + f"\n\n## 研究笔记\n{research_notes or '(无)'}\n\n"
+        f"## 上次验证失败\n{last_error}\n\n"
+        "请先用 TodoWrite 修订计划，然后调用 CallCodeAgent 委托修复。"
+    )
+
+
+def _verifier_input(
+    state: MokioGraphState,
+    memory: dict,
+    verification_results: list[VerificationResult],
+) -> str:
+    """构建 Verifier 节点的 HumanMessage 内容."""
+    memory_text = format_layered_memory_for_prompt(memory)
+    code_summary = state.get("code_agent_summary", "")
+    research_notes = state.get("research_notes", "")
+    sources = state.get("sources", []) or []
+    return (
+        f"## 分层记忆\n{memory_text}\n\n"
+        f"## 原始任务\n{state['task']}\n\n"
+        f"## 计划摘要\n{state.get('plan_summary', '')}\n\n"
+        f"## 验收标准\n"
+        + "\n".join(f"  {i+1}. {c}" for i, c in enumerate(state.get("acceptance_criteria", [])))
+        + f"\n\n## 研究笔记\n{research_notes or '(无)'}\n\n"
+        f"## 参考来源\n{_format_sources(sources)}\n\n"
+        f"## codeAgent 执行总结\n{code_summary or '(无)'}\n\n"
+        f"## 验证命令执行结果\n{_format_verification_results(verification_results)}\n\n"
+        f"请使用只读工具检查 codeAgent 产出的文件内容，"
+        f"然后调用 ReportVerification 提交你的验证判定。"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Helpers (提取/格式化)
 # ═══════════════════════════════════════════════════════════════════════
 
 def _extract_tool_call(messages: list, tool_name: str) -> dict | None:
@@ -314,29 +392,17 @@ def planner_node(state: MokioGraphState, *, writer=None) -> dict:
     agent = llm.bind_tools(tools)
 
     existing_todos = state.get("todos", [])
-    last_error = state.get("last_error", "")
-    research_notes = state.get("research_notes", "")
+
+    # ── 构建分层 Memory ──
+    memory = build_layered_memory(state, node="planner")
+    if writer is not None:
+        writer(memory_event(memory, node="planner"))
 
     # ── 构建消息 ──
-    if not existing_todos:
-        plan_context = (
-            f"## 用户任务\n{state['task']}\n\n"
-            f"请先用 TodoWrite 发布执行计划，然后根据需要调用 CallSearchAgent 搜索信息，"
-            f"最后调用 CallCodeAgent 委托实现。"
-        )
-    else:
-        plan_context = (
-            f"## 原始任务\n{state['task']}\n\n"
-            f"## 当前计划\n{_format_todos(existing_todos)}\n\n"
-            f"## 验收标准\n" + "\n".join(f"  - {c}" for c in state.get("acceptance_criteria", [])) + "\n\n"
-            f"## 研究笔记\n{research_notes or '(无)'}\n\n"
-            f"## 上次验证失败\n{last_error}\n\n"
-            f"请先用 TodoWrite 修订计划，然后调用 CallCodeAgent 委托修复。"
-        )
-
-    system_msg = SystemMessage(content=PLANNER_PROMPT)
-    user_msg = HumanMessage(content=plan_context)
-    messages: list = [system_msg, user_msg]
+    messages: list = [
+        SystemMessage(content=PLANNER_PROMPT),
+        HumanMessage(content=_planner_input(state, memory)),
+    ]
 
     # ── 单阶段工具循环：TodoWrite / CallSearchAgent / CallCodeAgent 同时可用 ──
     max_loops = max(10, len(existing_todos) * 2 + 4)
@@ -370,6 +436,27 @@ def planner_node(state: MokioGraphState, *, writer=None) -> dict:
                 tool_call_id=tool_call["id"],
             ))
 
+    # ── 提取 TodoWrite 调用，设置上下文路由 ──
+    todo_call = _extract_tool_call(messages, "TodoWrite")
+    update: dict = {}
+    if todo_call is not None:
+        plan_summary = todo_call.get("plan_summary", "")
+        todos = todo_call.get("todos", [])
+        acceptance_criteria = todo_call.get("acceptance_criteria", [])
+        verification_commands = todo_call.get("verification_commands", [])
+        update = {
+            "plan_summary": plan_summary,
+            "todos": todos,
+            "acceptance_criteria": acceptance_criteria,
+            "verification_commands": verification_commands,
+            "context_next_node": "verifier",
+        }
+    else:
+        update["context_next_node"] = "verifier"
+
+    update["messages"] = messages
+    return update
+
 
 def verifier_node(state: MokioGraphState) -> dict:
     """Verifier 节点：检查 codeAgent 的成果是否满足验收标准。
@@ -393,28 +480,16 @@ def verifier_node(state: MokioGraphState) -> dict:
     commands = state.get("verification_commands", [])
     verification_results = _run_verification_commands(commands, runtime.workspace)
 
-    # 2. 构建验证上下文
-    code_summary = state.get("code_agent_summary", "")
-    research_notes = state.get("research_notes", "")
-    sources = state.get("sources", []) or []
+    # 2. 构建分层 Memory 并注入
+    memory = build_layered_memory(state, node="verifier")
 
-    context = (
-        f"## 原始任务\n{state['task']}\n\n"
-        f"## 计划摘要\n{state.get('plan_summary', '')}\n\n"
-        f"## 验收标准\n" + "\n".join(f"  {i+1}. {c}" for i, c in enumerate(state.get("acceptance_criteria", []))) + "\n\n"
-        f"## 研究笔记\n{research_notes or '(无)'}\n\n"
-        f"## 参考来源\n{_format_sources(sources)}\n\n"
-        f"## codeAgent 执行总结\n{code_summary or '(无)'}\n\n"
-        f"## 验证命令执行结果\n{_format_verification_results(verification_results)}\n\n"
-        f"请逐项检查验收标准，检查 codeAgent 产出的文件，然后调用 ReportVerification 提交报告。"
-    )
-
+    # 3. 构建消息
     messages = [
         SystemMessage(content=VERIFIER_PROMPT),
-        HumanMessage(content=context),
+        HumanMessage(content=_verifier_input(state, memory, verification_results)),
     ]
 
-    # 3. LLM 验证（只读工具循环）
+    # 4. LLM 验证（只读工具循环）
     for _loop in range(8):
         response = agent.invoke(messages)
         messages.append(response)
@@ -511,9 +586,249 @@ def verifier_route(state: MokioGraphState) -> str:
     return "planner"
 
 
+def context_monitor_node(state: MokioGraphState) -> dict:
+    """上下文监控节点 —— 估算 token 数，决定是否需要压缩。
+
+    1. 估算当前 token 数：
+       token_count = model.get_num_tokens_from_messages(messages + [memory_payload])
+       如果异常，fallback 为 len(text) // 4
+    2. 判断是否需要压缩：
+       should_compress = token_count > context_token_limit (默认 400000)
+    3. context_next_node 由上游节点设置（planner 后设为 "verifier"，
+       verifier 失败后设为 "planner"）
+    4. 返回：
+       {
+           "context_token_count": token_count,
+           "context_should_compress": should_compress,
+           "context_next_node": state.get("context_next_node", "verifier"),
+       }
+    """
+    # ── 1. 获取当前上下文 token 上限 ──
+    context_token_limit: int = state.get("context_token_limit", 400000)
+
+    # ── 2. 构建 memory_payload ──
+    memory = build_layered_memory(state, node="context_monitor")
+    memory_text = format_layered_memory_for_prompt(memory)
+    memory_payload = SystemMessage(content=memory_text)
+
+    # ── 3. 估算消息 token 数（messages + memory_payload） ──
+    messages: list = state.get("messages", []) or []
+    model = create_model(model=state["runtime"].model, temperature=0.0)
+
+    try:
+        token_count = model.get_num_tokens_from_messages(messages + [memory_payload])
+    except Exception:
+        # fallback: 简单字符估算（每 4 个字符 ≈ 1 token）
+        total_text = ""
+        for msg in messages:
+            if hasattr(msg, "content") and isinstance(msg.content, str):
+                total_text += msg.content
+        total_text += memory_text
+        token_count = len(total_text) // 4
+
+    # ── 4. 判断是否需要压缩 ──
+    should_compress = token_count > context_token_limit
+
+    # ── 5. context_next_node 由上游节点设定 ──
+    next_node: str = state.get("context_next_node", "verifier")
+
+    return {
+        "context_token_count": token_count,
+        "context_should_compress": should_compress,
+        "context_next_node": next_node,
+    }
+
+
+def context_monitor_route(state: MokioGraphState) -> str:
+    """上下文监控后的路由决策.
+
+    Returns:
+        "final" — 已通过验证.
+        "context_compressor" — 需要压缩上下文.
+        其他 — 由 context_next_node 决定.
+    """
+    if state.get("passed"):
+        return "final"
+    if state.get("context_should_compress"):
+        return "context_compressor"
+    return state.get("context_next_node", "verifier")
+
+
+def context_compressor_route(state: MokioGraphState) -> str:
+    """上下文压缩后的路由决策.
+
+    压缩完成后不经过 monitor（刚压缩完不需要再压），
+    直接由 context_next_node 决定下一步。
+
+    Returns:
+        "verifier" | "planner" | "final"
+    """
+    if state.get("passed"):
+        return "final"
+    return state.get("context_next_node", "verifier")
+
+
+def context_compressor_node(state: MokioGraphState) -> dict:
+    """上下文压缩节点 —— 用 LLM 压缩消息历史，保留关键信息。
+
+    1. 用 LLM 压缩消息历史，保留关键信息：
+       - 调用 create_model().invoke([
+           SystemMessage(CONTEXT_COMPRESSION_PROMPT),
+           HumanMessage(当前所有消息 + 分层 memory 快照)
+         ])
+       - LLM 返回 JSON:
+         {summary, active_goal, completed_work, open_todos,
+          important_files, tool_findings, sources, next_steps, risks}
+    2. 替换消息历史为压缩后的摘要：
+       - 用 RemoveMessage(id=REMOVE_ALL_MESSAGES) 清除所有旧消息
+       - 添加一条 AIMessage(content=summary) 作为新的上下文起点
+    3. 持久化到 HISTORY_SUMMARY.md
+    4. 截断各字段的文本长度（_short_text）
+    5. 返回压缩事件：
+       {
+           "messages": [RemoveMessage, AIMessage(summary)],
+           "context_summary": summary,
+           "context_token_count": 新 token 数,
+           "context_should_compress": False,
+           "research_notes": 截断后,
+           "agent_handoffs": 截断后,
+           ... 其他截断字段,
+           "history_summary": summary,
+           "compression_events": [...prev, 新事件],
+       }
+    """
+    runtime: RuntimeState = state["runtime"]
+
+    # ── 1. 构建分层 memory 快照 ──
+    memory = build_layered_memory(state, node="context_compressor")
+    memory_text = format_layered_memory_for_prompt(memory)
+
+    # ── 2. 组装压缩 prompt ──
+    messages: list = state.get("messages", []) or []
+    payload_text = (
+        f"## Layered Memory Snapshot\n{memory_text}\n\n"
+        f"## Full Message History\n"
+    )
+    # 将消息序列化为紧凑文本表示
+    msg_lines: list[str] = []
+    for msg in messages:
+        role = msg.type if hasattr(msg, "type") else type(msg).__name__
+        content = msg.content if hasattr(msg, "content") else ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = json.dumps(content, ensure_ascii=False)
+        else:
+            text = str(content)
+        msg_lines.append(f"[{role}] {text}")
+    payload_text += "\n\n".join(msg_lines)
+
+    # ── 3. 调用 LLM 压缩 ──
+    model = create_model(model=runtime.model, temperature=0.0)
+    response = model.invoke([
+        SystemMessage(content=CONTEXT_COMPRESSION_PROMPT),
+        HumanMessage(content=payload_text),
+    ])
+
+    # ── 4. 解析 LLM 返回的 JSON ──
+    try:
+        compressed = json.loads(response.content)
+    except json.JSONDecodeError:
+        # fallback: 直接使用原始输出作为 summary
+        compressed = {"summary": response.content}
+
+    summary: str = compressed.get("summary", response.content)
+    active_goal: str = compressed.get("active_goal", "")
+    completed_work: str = compressed.get("completed_work", "")
+    open_todos: str = compressed.get("open_todos", "")
+    important_files: str = compressed.get("important_files", "")
+    tool_findings: str = compressed.get("tool_findings", "")
+    sources: str = compressed.get("sources", "")
+    next_steps: str = compressed.get("next_steps", "")
+    risks: str = compressed.get("risks", "")
+
+    # ── 5. 替换消息历史 ──
+    remove = RemoveMessage(id=REMOVE_ALL_MESSAGES)
+    new_msg = AIMessage(content=f"[Context Compressed]\n\n{summary}")
+
+    # ── 6. 持久化到 HISTORY_SUMMARY.md ──
+    history_path = runtime.workspace / "HISTORY_SUMMARY.md"
+    try:
+        history_path.write_text(summary, encoding="utf-8")
+    except OSError:
+        pass  # 写入失败不阻塞执行
+
+    # ── 7. 重新估算 token 数 ──
+    new_messages = [new_msg]
+    try:
+        new_token_count = model.get_num_tokens_from_messages(new_messages)
+    except Exception:
+        new_token_count = len(summary) // 4
+
+    # ── 8. 计算压缩前 token 数 ──
+    token_before = state.get("context_token_count", 0)
+
+    # ── 9. 构建压缩事件 ──
+    timestamp = datetime.now(timezone.utc).isoformat()
+    event: CompressionEvent = CompressionEvent(
+        timestamp=timestamp,
+        trigger="token_limit",
+        node="context_compressor",
+        token_count_before=token_before,
+        token_count_after=new_token_count,
+        summary=summary,
+    )
+    prev_events: list[CompressionEvent] = state.get("compression_events", []) or []
+    prev_events.append(event)
+
+    # ── 10. 截断各字段 ──
+    return {
+        "messages": [remove, new_msg],
+        "context_summary": _short_text(summary, 4000),
+        "context_token_count": new_token_count,
+        "context_should_compress": False,
+        "research_notes": _short_text(state.get("research_notes", "") or "", 2000),
+        "agent_handoffs": _trim_handoffs_local(state.get("agent_handoffs", []) or []),
+        "compression_events": prev_events,
+        "history_summary": summary,
+        # 复现压缩产出供后续节点使用
+        "active_goal": active_goal,
+        "completed_work": completed_work,
+        "open_todos": open_todos,
+        "important_files": important_files,
+        "tool_findings": tool_findings,
+        "next_steps": next_steps,
+        "risks": risks,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 内部辅助（节点实现细节）
 # ═══════════════════════════════════════════════════════════════════════
+
+def _short_text(text: str, limit: int) -> str:
+    """超长文本截断，末尾加 "..." 标记."""
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _trim_handoffs_local(handoffs: list[dict]) -> list[dict]:
+    """只保留最近 6 条交接记录，并精简字段."""
+    if not handoffs:
+        return []
+    trimmed = handoffs[-6:]
+    result: list[dict] = []
+    for h in trimmed:
+        result.append({
+            "from_agent": h.get("from_agent", ""),
+            "to_agent": h.get("to_agent", ""),
+            "instruction": _short_text(h.get("instruction", ""), 200),
+            "result": _short_text(h.get("result", ""), 200),
+        })
+    return result
 
 def _mark_todos_from_verification(
     todos: list[TodoItem],

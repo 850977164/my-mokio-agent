@@ -5,7 +5,7 @@
     完成代码编写、修改和验证工作。
 
 用法：
-    result = run_code_agent(state, instruction, writer=writer)
+    result = run_code_agent(state, instruction, memory_text=memory_text, writer=writer)
     # → {ok: True, summary, todos, messages, tool_events}
 """
 
@@ -43,11 +43,29 @@ Rules:
 - End with a concise summary of files changed and checks run."""
 
 
+def _code_agent_input(instruction: str, *, memory: dict | None = None) -> str:
+    """构建 codeAgent 的 HumanMessage 内容."""
+    lines: list[str] = [
+        "请完成以下实现任务:",
+        "",
+        instruction,
+        "",
+        "请先阅读相关文件，然后按步骤实现。每完成一个步骤，请用 TodoUpdate 更新进度。",
+    ]
+    if memory is not None:
+        # 延迟导入避免循环依赖
+        from mokioclaw.graph.memory import format_layered_memory_for_prompt  # noqa: PLC0415
+        memory_text = format_layered_memory_for_prompt(memory)
+        lines.insert(1, f"## 分层记忆\n{memory_text}\n")
+    return "\n\n".join(lines)
+
+
 def run_code_agent(
     state: RuntimeState,
     instruction: str,
     *,
     writer: Any = None,
+    memory: dict | None = None,
     max_loops: int = 10,
 ) -> dict:
     """运行代码专家 Agent，在 workspace 中完成实现任务。
@@ -56,6 +74,8 @@ def run_code_agent(
         state: 运行时状态（提供 model、workspace 等配置）。
         instruction: Planner 下达的实现指令（含任务 + 计划 + 研究笔记等）。
         writer: LangGraph StreamWriter（可选），用于发射实时事件。
+        memory: build_layered_memory() 返回的分层记忆快照，
+                如为 None 则不注入 memory。
         max_loops: 最大 ReAct 轮数，默认 10。
 
     Returns:
@@ -73,28 +93,13 @@ def run_code_agent(
     llm = create_model(model=state.model, temperature=0.0)
     agent = llm.bind_tools(tools)
 
-    # ── 2. layered memory 快照（后续阶段实现，先留接口） ──
-    # TODO: 从持久化存储中读取已有的 notes / 上下文
-    memory_context = ""
+    # ── 2. 构建消息 ──
+    messages = [
+        SystemMessage(content=CODE_AGENT_PROMPT),
+        HumanMessage(content=_code_agent_input(instruction, memory=memory)),
+    ]
 
-    # ── 3. 构建消息 ──
-    system_msg = SystemMessage(content=CODE_AGENT_PROMPT)
-    user_msg = HumanMessage(content=(
-        f"请完成以下实现任务:\n\n{instruction}\n\n"
-        "请先阅读相关文件，然后按步骤实现。每完成一个步骤，"
-        "请用 TodoUpdate 更新进度。"
-    ))
-    if memory_context:
-        user_msg = HumanMessage(content=(
-            f"请完成以下实现任务:\n\n{instruction}\n\n"
-            f"## 历史笔记 / 上下文\n{memory_context}\n\n"
-            "请先阅读相关文件，然后按步骤实现。每完成一个步骤，"
-            "请用 TodoUpdate 更新进度。"
-        ))
-
-    messages: list = [system_msg, user_msg]
-
-    # ── 4. ReAct 循环 ──
+    # ── 3. ReAct 循环 ──
     todos: list[dict] = []   # 从 TodoUpdate 调用中收集的 todo 状态变更
     tool_events: list[dict] = []
 
@@ -146,7 +151,7 @@ def run_code_agent(
                 tool_call_id=tool_call["id"],
             ))
 
-    # ── 5. 提取 AI 最终总结 ──
+    # ── 4. 提取 AI 最终总结 ──
     last_content = ""
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content:
