@@ -1,11 +1,11 @@
-"""LangGraph 图编译入口 —— Plan & Execute 工作流.
+"""LangGraph 图编译入口 —— MultiAgent 工作流.
 
-将 Planner / Actor / Verifier / Final 四个节点组装为状态图，
-由 LangGraph 引擎驱动完整生命周期:
+将 Planner / Verifier / Final 三个节点组装为状态图，
+Planner 通过工具调用委托 searchAgent 和 codeAgent:
 
-    START → Planner → Actor → Verifier → Final → END
-                        ↑          │
-                        └──────────┘ (verifier_route → "planner")
+    START → Planner → Verifier → Final → END
+                ↑          │
+                └──────────┘ (verifier_route → "planner")
 
 Usage:
     from mokioclaw.graph.workflow import build_workflow
@@ -19,7 +19,6 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 
 from mokioclaw.graph.nodes import (
-    actor_node,
     planner_node,
     verifier_node,
     verifier_route,
@@ -41,9 +40,11 @@ def final_node(state: MokioGraphState) -> dict:
     plan_summary: str = state.get("plan_summary", "")
     attempts: int = state.get("attempts", 0)
     max_attempts: int = state.get("max_attempts", 3)
-    last_actor_summary: str = state.get("last_actor_summary", "")
+    code_agent_summary: str = state.get("code_agent_summary", "")
     verification_checks: list[dict] = state.get("verification_checks", [])
     verification_results: list[dict] = state.get("verification_results", [])
+    research_notes: str = state.get("research_notes", "")
+    agent_handoffs: list[dict] = state.get("agent_handoffs", [])
 
     lines: list[str] = []
 
@@ -62,11 +63,28 @@ def final_node(state: MokioGraphState) -> dict:
     lines.append(f"🔁 尝试次数: {attempts}/{max_attempts}")
     lines.append("")
 
-    # ── Actor 总结 ──
+    # ── Agent 委托记录 ──
+    if agent_handoffs:
+        lines.append("─" * 60)
+        lines.append("🤖 Agent 委托记录")
+        lines.append("─" * 60)
+        for h in agent_handoffs:
+            lines.append(f"  {h.get('from_agent', '?')} → {h.get('to_agent', '?')}: {h.get('instruction', '')[:120]}")
+        lines.append("")
+
+    # ── 研究笔记 ──
+    if research_notes:
+        lines.append("─" * 60)
+        lines.append("🔍 研究笔记")
+        lines.append("─" * 60)
+        lines.append(research_notes[:1000])
+        lines.append("")
+
+    # ── codeAgent 总结 ──
     lines.append("─" * 60)
-    lines.append("🔧 Actor 执行总结")
+    lines.append("🔧 codeAgent 执行总结")
     lines.append("─" * 60)
-    lines.append(last_actor_summary or "(Actor 未产出总结)")
+    lines.append(code_agent_summary or "(codeAgent 未产出总结)")
     lines.append("")
 
     # ── 验证命令结果 ──
@@ -114,7 +132,6 @@ def final_node(state: MokioGraphState) -> dict:
         lines.append("🏁 最终结果: PASSED — 所有验收标准均已满足。")
     else:
         lines.append("🏁 最终结果: FAILED — 未通过验收。")
-        # 列出失败项
         failed = [c for c in verification_checks if not c.get("passed", True)]
         if failed:
             lines.append("     失败项:")
@@ -127,7 +144,7 @@ def final_node(state: MokioGraphState) -> dict:
 
 
 def build_workflow():
-    """编译并返回 Plan & Execute 工作流图.
+    """编译并返回 MultiAgent 工作流图.
 
     Returns:
         CompiledStateGraph: 已编译的 LangGraph 状态图，可直接 .invoke() 调用.
@@ -136,14 +153,12 @@ def build_workflow():
 
     # ── 注册节点 ──
     graph.add_node("planner", planner_node)
-    graph.add_node("actor", actor_node)
     graph.add_node("verifier", verifier_node)
     graph.add_node("final", final_node)
 
     # ── 连线 ──
     graph.add_edge(START, "planner")
-    graph.add_edge("planner", "actor")
-    graph.add_edge("actor", "verifier")
+    graph.add_edge("planner", "verifier")
     graph.add_conditional_edges(
         "verifier",
         verifier_route,

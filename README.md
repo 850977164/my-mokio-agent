@@ -1,60 +1,135 @@
 # MokioClaw
 
-> Plan & Execute 智能调度代理 —— 制定计划、执行任务、自动验证、失败重试
+> MultiAgent 智能调度代理 —— Supervisor 委派专家 Agent 执行任务，自动验证，失败重试
 
-MokioClaw 是一个基于 LangGraph 的 AI 编程代理。你给它一个自然语言任务描述，它会自动拆解为可执行的步骤，用工具（读写文件、运行命令、搜索代码）逐步完成，然后运行验收命令验证成果 —— 不通过就重试，直到通过或达到上限。
+MokioClaw 是一个基于 LangGraph 的 MultiAgent AI 编程代理。你给它一个自然语言任务描述，Supervisor（Planner）自动拆解为可执行的计划，通过工具调用委派 searchAgent 搜索信息、codeAgent 编写代码，然后 Verifier 运行验收命令验证成果——不通过就返回 Planner 修订重试，直到通过或达到上限。
 
 ---
 
 ## 架构设计
 
 ```
-                     ┌─────────────┐
-                     │   START     │
-                     └──────┬──────┘
-                            │
-                            ▼
-                     ┌─────────────┐
-                     │   Planner   │  ← 制定计划、写验收标准
-                     └──────┬──────┘
-                            │
-                            ▼
-                     ┌─────────────┐
-                     │    Actor    │  ← 按计划执行，使用工具
-                     └──────┬──────┘
-                            │
-                            ▼
-                     ┌─────────────┐
-                     │  Verifier   │  ← 运行验收命令，判断是否通过
-                     └──────┬──────┘
-                            │
-                     ┌──────┴──────┐
-                     │   passed?   │
-                     └──┬──────┬───┘
-                   yes  │      │  no
-                        ▼      ▼
-                 ┌─────────┐  ┌─────────┐
-                 │  Final   │  │ Planner │  ← 重新规划修复方案
-                 └────┬────┘  └─────────┘
-                      │            │
-                      ▼            │
-                 ┌─────────┐      │
-                 │   END   │◀─────┘
-                 └─────────┘  (max_attempts 次后也到 END)
+                    ┌─────────────┐
+                    │   START     │
+                    └──────┬──────┘
+                           │
+                           ▼
+               ┌───────────────────────┐
+               │  Planner (Supervisor) │
+               │                       │
+               │  TodoWrite            │  ← 发布/修订执行计划
+               │  CallSearchAgent ──────────→ searchAgent (WebSearch)
+               │  CallCodeAgent ────────────→ codeAgent   (File/Shell)
+               │                       │
+               └───────┬───────────────┘
+                       │
+                       ▼
+               ┌──────────────┐
+               │   Verifier   │  ← 运行验证命令，逐项检查验收标准
+               └──────┬───────┘
+                      │
+               ┌──────┴──────┐
+               │   passed?   │
+               └──┬──────┬───┘
+             yes  │      │  no
+                  ▼      ▼
+            ┌────────┐ ┌─────────┐
+            │ Final  │ │ Planner │  ← 重新规划，仅修订失败项
+            └───┬────┘ └─────────┘
+                │           │
+                ▼           │  (max_attempts 次后强制到 Final)
+            ┌───────┐       │
+            │  END  │◀──────┘
+            └───────┘
 ```
 
-### 四节点详解
+### MultiAgent 委派模型
 
-| 节点 | 职责 | 使用策略 |
+Planner 不直接操作文件或搜索网络，而是通过三个工具协调工作：
+
+| 工具 | 作用 | 委派对象 |
 |---|---|---|
-| **Planner** | 将用户任务拆解为有序的 todo 列表，每项包含具体的验收标准和可执行的验证命令 | 首次调用时从头规划；后续调用时根据 Verifier 的错误反馈修订计划，保留已完成的项，只为失败项生成新的 todo |
-| **Actor** | 按 Planner 的计划逐步执行，使用文件/Bash/Grep 工具完成每个 todo，通过 TodoUpdate 标记进度 | 首次执行看到完整计划；重试轮只看到未完成的 todo + Verifier 反馈，避免受到历史对话的干扰 |
-| **Verifier** | 先在 workspace 运行 shell 验证命令（pytest、mypy 等），再用只读工具检查文件内容是否符合验收标准 | 双重验证：命令执行结果 + LLM 逐项人工审查，两者都通过才算 passed |
-| **Final** | 将 passed/failed 状态格式化为可读的最终报告 | 纯格式化逻辑，不调用 LLM，保证任何异常状态下都有可读输出 |
+| **TodoWrite** | 向系统提交执行计划（plan_summary + todos + acceptance_criteria + verification_commands） | 系统 |
+| **CallSearchAgent** | 将网络研究任务委派给 searchAgent。searchAgent 使用 WebSearchTool（Tavily API）搜索互联网，返回研究笔记和来源 URL | searchAgent |
+| **CallCodeAgent** | 将代码实现任务委派给 codeAgent。codeAgent 在 workspace 中使用 FileRead / FileWrite / FileEdit / Grep / Bash / TodoUpdate 完成开发工作 | codeAgent |
+
+### 三节点详解
+
+| 节点 | 职责 | 关键行为 |
+|---|---|---|
+| **Planner (Supervisor)** | 接收用户任务，制定执行计划，委派 searchAgent 和 codeAgent 工作 | 三种工具同时可用，LLM 自主决定调用顺序。首次生成完整计划 + 委派实现；修订轮只委派修复 |
+| **Verifier** | 运行 shell 验证命令 + 用只读工具检查文件内容，对照验收标准逐项评估 | 双重验证：命令退出码 + LLM 审查。通过 ReportVerification 工具输出结构化结果 |
+| **Final** | 将 passed/failed 状态格式化为人类可读的最终报告 | 纯格式化逻辑，不调用 LLM，确保任何异常状态下都有可读输出 |
 
 ### 状态流转
 
-整个工作流共享一个 `MokioGraphState`（TypedDict），包含 task、plan、todos、verification_results、passed、attempts 等字段。LangGraph 在每个节点间自动传递和 merge 状态更新。`messages` 字段使用了 `add_messages` reducer，自动追加而不是覆盖对话历史。
+整个工作流共享一个 `MokioGraphState`（TypedDict），统一管理任务生命周期：
+
+```
+task                              # 用户原始任务
+runtime                           # RuntimeState (workspace, model)
+messages                          # 完整 LLM 对话历史 (add_messages reducer)
+plan_summary / todos / acceptance_criteria / verification_commands  # Plan 阶段产出
+research_notes / sources          # searchAgent 研究笔记和来源
+agent_handoffs                    # Planner → 子 Agent 的每次委派记录
+code_agent_summary                # codeAgent 执行总结
+verification_results / verification_checks / passed  # Verify 阶段产出
+attempts / max_attempts / last_error  # 循环控制
+final_answer                      # 最终汇总
+```
+
+### 自愈式重试循环
+
+Verifier 不简单地说「通过/失败」，而是输出具体的 `recommended_next_instruction`（失败原因 + 修复建议）。Planner 在修订轮把反馈转化为更新的 TodoWrite + 针对性的 CallCodeAgent 委派，形成带反馈的自愈循环，最多重试 `max_attempts` 次。
+
+---
+
+## 项目结构
+
+```
+src/mokioclaw/
+├── __init__.py                  # 包入口，版本号
+├── __main__.py                  # python -m mokioclaw 入口
+│
+├── agents/                      # 专家 Agent
+│   ├── __init__.py              # 导出 run_code_agent / run_search_agent
+│   ├── search_agent.py          # SearchAgent — WebSearch 搜索专家
+│   └── code_agent.py            # CodeAgent  — 文件/Shell 代码实现专家
+│
+├── cli/
+│   ├── __init__.py
+│   └── app.py                   # Typer CLI，事件渲染（Rich Panel）
+│
+├── core/
+│   ├── __init__.py
+│   ├── agent.py                 # stream_agent_events() — 图事件流入口
+│   ├── paths.py                 # workspace 路径解析与安全校验 (safe_path)
+│   └── state.py                 # RuntimeState dataclass
+│
+├── graph/                       # LangGraph 图定义
+│   ├── __init__.py              # 导出 state / nodes / workflow
+│   ├── state.py                 # MokioGraphState, TodoItem, VerificationResult, SourceItem, AgentHandoff
+│   ├── nodes.py                 # planner_node, verifier_node, verifier_route
+│   └── workflow.py              # build_workflow() + final_node
+│
+├── prompts/
+│   ├── __init__.py
+│   ├── stage2.py                # Plan & Execute 四节点 prompt（上一版）
+│   └── stage3.py                # MultiAgent prompt（当前使用）
+│
+├── providers/
+│   ├── __init__.py
+│   └── openai_provider.py       # create_model() — ChatOpenAI 工厂（OpenAI 兼容 API）
+│
+└── tools/
+    ├── __init__.py              # 导出 build_tools / build_read_only_tools
+    ├── registry.py              # build_tools() / build_read_only_tools()
+    ├── bash_tool.py             # Bash  — shell 命令执行（120s 超时）
+    ├── file_tools.py            # FileRead / FileWrite / FileEdit
+    ├── grep_tool.py             # Grep  — 正则搜索文件内容
+    ├── structured_tools.py      # TodoWrite / TodoUpdate / ReportVerification（结构化输出桩）
+    └── web_search_tool.py       # WebSearch — Tavily API 网络搜索
+```
 
 ---
 
@@ -68,9 +143,11 @@ cd my-mokio-agent
 # 安装依赖
 uv sync
 
-# 设置 API Key
-export OPENAI_API_KEY="sk-..."
-export MODEL="gpt-4o"          # 可选，默认 gpt-4o
+# 配置环境变量（.env 文件或 export）
+API_KEY="sk-..."           # OpenAI 兼容 API 密钥
+BASE_URL="https://..."      # API 端点（可选）
+MODEL="gpt-4o"             # 默认模型（可选）
+TAVILY_API_KEY="tvly-..."  # Tavily 搜索 API 密钥（可选，用于 WebSearch）
 ```
 
 ## 使用
@@ -105,39 +182,29 @@ mokioclaw "找出所有 TODO 注释" -w ./src -a 3
 📂 workspace:   /path/to/workspace
 🤖 model:       gpt-4o
 🔁 max attempts: 3
-📋 task:        帮我实现一个 Conway's Game of Life，要求 TDD
+📋 task:        搜索 React 19 新特性并写一篇总结
 
 ┌── 📋 Planner ──────────────────────────────────────┐
-│ 实现 Conway's Game of Life，TDD 方式：先写测试...
+│ 1. 先用 TodoWrite 发布研究+写作计划
+│ 2. 委派 searchAgent 搜索 React 19 新特性
+│ 3. 委派 codeAgent 根据研究笔记撰写总结文档
 │
 │ 📝 待办项:
-│   ⬜ [1] 编写 conftest.py 和 pytest 配置
-│   ⬜ [2] 编写 Grid 类的测试
-│   ⬜ [3] 实现 Grid 类
-│   ⬜ [4] 编写 next_generation 的测试
-│   ...
+│   ⬜ [1] 搜索 React 19 的新特性
+│   ⬜ [2] 整理研究笔记
+│   ⬜ [3] 编写 React19-summary.md 文档
 │
 │ ✔️  验收标准:
-│   1. pytest 运行所有测试通过
-│   2. Blinker 周期振荡器正常工作
-│   ...
-└────────────────────────────────────────────────────┘
-
-┌── 🔧 Actor ───────────────────────────────────────┐
-│ 完成 9/9  受阻 0  进行中 0  待办 0
-│ 已创建 test_game_of_life.py (24 个测试)...
+│   1. React19-summary.md 存在且包含完整内容
+│   2. 文档引用了可靠的来源 URL
 └────────────────────────────────────────────────────┘
 
 ┌── ✅ Verifier ────────────────────────────────────┐
 │ ✅ 验证通过  (第 1 次)
 │
-│ 🖥️  验证命令:
-│   ✅ $ pytest test_game_of_life.py -v (exit=0)
-│
 │ 📊 验收明细:
-│   ✅ 24 tests all pass
-│   ✅ Blinker period-2 oscillator
-│   ...
+│   ✅ 文件存在且内容完整
+│   ✅ 引用了 3 个来源 URL
 └────────────────────────────────────────────────────┘
 
 ┌── 📝 最终结果 ────────────────────────────────────┐
@@ -147,71 +214,31 @@ mokioclaw "找出所有 TODO 注释" -w ./src -a 3
 
 ---
 
-## 项目结构
-
-```
-src/mokioclaw/
-├── __init__.py              # 包入口，版本号
-├── __main__.py              # python -m mokioclaw 入口
-│
-├── cli/
-│   ├── __init__.py
-│   └── app.py               # Typer CLI，事件渲染（Rich Panel）
-│
-├── core/
-│   ├── __init__.py
-│   ├── agent.py             # stream_agent_events() — 图事件流入口
-│   ├── paths.py             # workspace 路径解析与安全校验
-│   └── state.py             # RuntimeState dataclass
-│
-├── graph/
-│   ├── __init__.py           # 导出 state / nodes / workflow
-│   ├── state.py              # MokioGraphState, TodoItem, VerificationResult
-│   ├── nodes.py              # planner_node, actor_node, verifier_node, verifier_route
-│   └── workflow.py           # build_workflow() + final_node
-│
-├── prompts/
-│   ├── __init__.py
-│   └── stage2.py             # PLANNER / ACTOR / VERIFIER / FINAL 四个 prompt
-│
-├── providers/
-│   ├── __init__.py
-│   └── openai_provider.py    # create_model() — ChatOpenAI 工厂
-│
-└── tools/
-    ├── __init__.py
-    ├── registry.py           # build_tools() / build_read_only_tools()
-    ├── bash_tool.py          # Bash 命令执行（120s 超时）
-    ├── file_tools.py         # FileRead / FileWrite / FileEdit
-    └── grep_tool.py          # 正则搜索
-```
-
----
-
 ## 关键设计决策
 
-### Plan & Execute 而非一次性 ReAct
+### Supervisor + 专家 Agent 委派模型
 
-传统的 ReAct 循环让 LLM 边想边做，遇到复杂任务容易迷失方向或遗漏步骤。Plan & Execute 强制「先规划、再执行、后验证」三阶段分离：
-- **Planner** 有独立的上下文窗口来思考全局策略
-- **Actor** 只关注执行，不被规划分心
-- **Verifier** 以怀疑者视角审视成果，不信任 Actor 的自我报告
+传统 ReAct 循环让单一 LLM 边想边做，工具多了容易迷失。MultiAgent 架构将「规划/决策」与「执行」分离到不同 Agent：
 
-### 自愈式重试循环
+- **Planner (Supervisor)** 拥有独立上下文窗口来思考全局策略，通过工具调用委派工作，不直接操作文件或搜索
+- **searchAgent** 专注网络调研，只暴露 WebSearch 工具，不会被文件操作分心
+- **codeAgent** 专注代码实现，只暴露文件/Shell 工具，在 workspace 内完成任务并通过 TodoUpdate 汇报进度
 
-Verifier 不是简单地说「通过/失败」，而是输出具体的 `recommended_next_instruction`（失败原因 + 修复建议）。Planner 在修订轮把这些反馈转化为新的 todo，Actor 再执行。这形成了一个 **带反馈的自愈循环**，最多重试 `max_attempts` 次。
+### 单阶段工具循环
+
+Planner 不强制分阶段（先计划再委派），而是将 TodoWrite / CallSearchAgent / CallCodeAgent 三种工具同时开放。LLM 自由决定调用顺序，减少不必要的中间 human message 注入，让对话流程更自然。
 
 ### 所有工具路径沙箱化
 
-每个工具都接收 `workspace: Path` 参数，通过 `safe_path()` 确保所有文件操作都在 workspace 内。Agent 不能访问工作区外的文件。
-
-### 重试轮 Actor 专用 Prompt
-
-Actor 在重试轮收到的消息与首次不同：只列出未完成的 todo + Verifier 失败反馈，不会看到已完成 TODO 的完整上下文。这防止了 LLM 的"我上次做完了"惯性。
+每个工具都接收 `workspace: Path` 参数，通过 `safe_path()` 确保所有文件操作都在 workspace 内，防止 `../` 路径逃逸。
 
 ### final_node 不调用 LLM
 
-Final 节点是纯文本格式化函数。因为 Planner / Actor / Verifier 都可能因为 LLM 调用异常而产出不完整的状态，final_node 保证无论什么情况都能生成一份可读的最终报告。
+Final 节点是纯文本格式化函数。因为 Planner / Verifier 都可能因 LLM 调用异常而产出不完整的状态，final_node 保证无论什么情况都能生成可读的最终报告。
+
+### 结构化工具桩模式
+
+TodoWrite、TodoUpdate、ReportVerification 是 no-op 桩工具——LLM 通过 function calling 调用它们，实际的结构化数据由调用方从 tool-call args 中提取。这比让 LLM 输出 JSON 字符串更可靠，因为 function calling 的参数解析由模型提供商保证 JSON Schema 合规。
 
 ---
 

@@ -5,11 +5,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-"""
-  从 LangChain 框架中导入 StructuredTool，这是 LangChain 工具系统的核心类。StructuredTool
-  允许你定义一个带有结构化输入参数的工具（区别于只接受原始字符串的普通 Tool）。AI Agent 会通过 function calling
-  机制自动将自然语言转为结构化参数来调用它。
-"""
 from langchain_core.tools import StructuredTool
 
 
@@ -35,6 +30,8 @@ def _run_bash(
             shell=True,
             capture_output=True,        # 捕获输出：等同于 stdout=PIPE, stderr=PIPE，把标准输出和标准错误都捕获到内存中
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds,
             cwd=str(workspace),
         )

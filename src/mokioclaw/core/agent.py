@@ -1,11 +1,10 @@
-"""Graph Agent —— 基于 Plan & Execute 工作流的事件流.
+"""Graph Agent —— 基于 MultiAgent 工作流的事件流.
 
 将 LangGraph 的 stream 输出转换为统一的 dict 事件流，
 供 CLI / GUI / API 层消费。
 
 事件类型:
     planner   — Planner 节点产出 (plan_summary, todos, acceptance_criteria, …)
-    actor     — Actor 节点产出 (last_actor_summary, todos)
     verifier  — Verifier 节点产出 (passed, verification_results, verification_checks, …)
     final     — Final 节点产出 (final_answer)
     custom    — 节点内部通过 StreamWriter 发射的自定义事件 (透传)
@@ -27,7 +26,7 @@ def stream_agent_events(
     max_attempts: int = 3,
     model: str | None = None,
 ) -> Iterator[dict]:
-    """运行 Plan & Execute 工作流，以事件流形式产出每个节点的结果.
+    """运行 MultiAgent 工作流，以事件流形式产出每个节点的结果.
 
     内部调用 ``build_workflow().stream()`` 驱动 LangGraph 图，
     将 (namespace, mode, chunk) 三元组解析为统一格式的 dict 事件。
@@ -43,9 +42,6 @@ def stream_agent_events(
 
         - ``{"type": "planner", "plan_summary": str, "todos": list, ...}``
           Planner 节点完成，产出/修订了执行计划。
-
-        - ``{"type": "actor", "last_actor_summary": str, "todos": list, ...}``
-          Actor 节点完成，已执行了所有待办项。
 
         - ``{"type": "verifier", "passed": bool, "verification_results": list, ...}``
           Verifier 节点完成，包含验证结果。

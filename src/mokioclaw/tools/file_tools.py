@@ -143,7 +143,7 @@ def _edit_file(
 
     if occurrences == 0:
         raise ValueError(
-            f"未找到匹配文本: old_text 在文件中不存在"
+            "未找到匹配文本: old_text 在文件中不存在"
         )
     if occurrences > 1:
         raise ValueError(

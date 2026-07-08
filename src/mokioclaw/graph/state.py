@@ -1,10 +1,12 @@
-"""LangGraph 图状态定义 —— Plan & Execute 架构的共享状态.
+"""LangGraph 图状态定义 —— MultiAgent 架构的共享状态.
 
 核心设计:
     - messages 字段使用 Annotated[list, add_messages] 注解，
       让 LangGraph 自动追加消息而非覆盖，保持完整对话历史。
     - TodoItem 记录每个计划步骤的进度。
     - VerificationResult 记录计划完成后的自动验证结果。
+    - SourceItem 记录搜索来源。
+    - AgentHandoff 记录 Agent 间委托。
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from mokioclaw.core.state import RuntimeState
 class TodoItem(TypedDict):
     """计划中的一个待办项。
 
-    由 Planner 生成，由 Executor 逐个执行，
+    由 Planner 生成，由 codeAgent 逐个执行，
     进度通过 status 追踪。
     """
 
@@ -34,13 +36,13 @@ class TodoItem(TypedDict):
     """当前状态: "pending" | "in_progress" | "completed" | "blocked"."""
 
     note: str
-    """执行笔记，Executor 完成后填入（成功/失败原因等）."""
+    """执行笔记，codeAgent 完成后填入（成功/失败原因等）."""
 
 
 class VerificationResult(TypedDict):
     """一条验证命令的执行结果。
 
-    在 Executor 完成所有 todo 后，
+    在 codeAgent 完成所有 todo 后，
     Verifier 节点逐个执行 acceptance_criteria 中列出的验证命令，
     每个命令产出一条 VerificationResult。
     """
@@ -61,10 +63,49 @@ class VerificationResult(TypedDict):
     """命令标准错误."""
 
 
-class MokioGraphState(TypedDict, total=False):
-    """Plan & Execute 图的共享状态。
+class SourceItem(TypedDict, total=False):
+    """一条搜索来源。
 
-    所有节点（Planner / Executor / Verifier）共享同一个 state dict，
+    由 searchAgent 返回，记录在 state.sources 中供后续引用。
+    """
+
+    title: str
+    """来源标题."""
+
+    url: str
+    """来源 URL."""
+
+    content: str
+    """来源内容摘要."""
+
+    score: float
+    """相关性评分."""
+
+
+class AgentHandoff(TypedDict, total=False):
+    """一次 Agent 间委托记录。
+
+    Planner 通过 CallSearchAgentTool / CallCodeAgentTool
+    委托任务给子 Agent 时生成一条记录。
+    """
+
+    from_agent: str
+    """委托方，通常为 "planner"."""
+
+    to_agent: str
+    """被委托方，"searchAgent" 或 "codeAgent"."""
+
+    instruction: str
+    """委托指令."""
+
+    result: str
+    """子 Agent 返回的结果摘要."""
+
+
+class MokioGraphState(TypedDict, total=False):
+    """MultiAgent 图的共享状态。
+
+    所有节点（Planner / Verifier / Final）共享同一个 state dict，
     通过读写各自关心的字段完成协调。
 
     关键注解:
@@ -88,7 +129,7 @@ class MokioGraphState(TypedDict, total=False):
     """完整的 LLM 对话历史。
 
     使用 add_messages reducer，节点写入时自动追加而非覆盖。
-    每个节点（Planner / Executor / Verifier）都将自己的
+    每个节点（Planner / Verifier）都将自己的
     SystemMessage / HumanMessage / AIMessage / ToolMessage 追加到此列表。
     """
 
@@ -103,7 +144,22 @@ class MokioGraphState(TypedDict, total=False):
     """验收标准列表，每条描述一个可通过验证命令检查的条件."""
 
     verification_commands: list[str]
-    """由 Planner 或 Executor 生成的验证命令列表（如 pytest、lint）."""
+    """由 Planner 生成的验证命令列表（如 pytest、lint）."""
+
+    # ── 搜索研究产出 ──
+    research_notes: str
+    """searchAgent 返回的研究笔记汇总，供 Planner 和 Verifier 参考."""
+
+    sources: list[SourceItem]
+    """searchAgent 收集的所有来源 URL 及摘要."""
+
+    # ── Agent 委托记录 ──
+    agent_handoffs: list[AgentHandoff]
+    """Planner → 子 Agent 的每次委托记录."""
+
+    # ── Code Agent 产出 ──
+    code_agent_summary: str
+    """codeAgent 执行后的总结，供 Verifier 评估."""
 
     # ── Verify 阶段产出 ──
     verification_results: list[VerificationResult]
@@ -118,10 +174,6 @@ class MokioGraphState(TypedDict, total=False):
 
     max_attempts: int
     """最大尝试次数，超过后强制退出，防止无限循环."""
-
-    # ── Actor 产出 ──
-    last_actor_summary: str
-    """Actor 节点最后一次执行后的总结，供 Verifier 评估."""
 
     # ── Verify 阶段详细结果 ──
     verification_checks: list[dict]

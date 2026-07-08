@@ -1,13 +1,16 @@
-"""Plan & Execute 图节点 —— Planner / Actor / Verifier 三节点实现.
+"""MultiAgent 图节点 —— Planner / Verifier 两节点实现.
 
 架构:
-    Planner ──→ Actor ──→ Verifier ──→ Final (passed)
-                    ↑          │
-                    └──────────┘ (retry, up to max_attempts)
+    Planner ──→ Verifier ──→ Final (passed)
+        ↑            │
+        └────────────┘ (retry, up to max_attempts)
 
-Planner:     根据任务生成/修订计划（todos、验收标准、验证命令）。
-Actor:       按计划执行，使用工具完成每个 todo。
-Verifier:    检查成果是否满足验收标准，运行验证命令。
+    Planner 通过工具调用委托任务:
+        - TodoWriteTool:     发布/修订计划
+        - CallSearchAgentTool: 委托搜索任务给 searchAgent
+        - CallCodeAgentTool:   委托实现任务给 codeAgent
+
+    Verifier: 检查成果是否满足验收标准，运行验证命令。
 """
 
 from __future__ import annotations
@@ -18,79 +21,154 @@ import subprocess
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
+from mokioclaw.agents.code_agent import run_code_agent
+from mokioclaw.agents.search_agent import run_search_agent
 from mokioclaw.core.state import RuntimeState
-from mokioclaw.graph.state import MokioGraphState, TodoItem, VerificationResult
-from mokioclaw.prompts.stage2 import (
-    ACTOR_PROMPT,
-    PLANNER_PROMPT,
-    VERIFIER_PROMPT,
+from mokioclaw.graph.state import (
+    AgentHandoff,
+    MokioGraphState,
+    SourceItem,
+    TodoItem,
+    VerificationResult,
 )
+from mokioclaw.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
 from mokioclaw.providers.openai_provider import create_model
-from mokioclaw.tools.registry import build_tools, build_read_only_tools
+from mokioclaw.tools.registry import build_read_only_tools
+from mokioclaw.tools.structured_tools import (
+    ReportVerificationTool,
+    TodoWriteTool,
+)
+
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Structured-output tools (LLM calls these to return structured data)
+# Agent delegation tool factories
 # ═══════════════════════════════════════════════════════════════════════
 
-def _write_todos(
-    plan_summary: str,
-    todos: list[dict],
-    acceptance_criteria: list[str],
-    verification_commands: list[str],
-) -> str:
-    """No-op stub: the Planner node extracts the structured data from the tool-call args."""
-    return f"计划已记录: {len(todos)} 个步骤, {len(acceptance_criteria)} 条验收标准"
+def _make_call_search_agent_tool(state: MokioGraphState, writer) -> StructuredTool:
+    """创建 CallSearchAgentTool —— 委托搜索任务给 searchAgent。"""
+
+    def _call(instruction: str) -> str:
+        """委托搜索任务给 searchAgent。
+
+        Args:
+            instruction: 搜索指令，描述需要研究什么内容。
+
+        Returns:
+            搜索结果摘要 JSON 字符串。
+        """
+        runtime: RuntimeState = state["runtime"]
+
+        # 发射 handoff 事件
+        event = {"type": "handoff", "from": "planner", "to": "searchAgent", "instruction": instruction[:500]}
+        if writer is not None:
+            writer(event)
+
+        result = run_search_agent(runtime, instruction, writer=writer)
+
+        # 更新 state 中的研究笔记和来源
+        existing_notes = state.get("research_notes", "")
+        new_notes = result.get("summary", "")
+        state["research_notes"] = (existing_notes + "\n\n" + new_notes).strip() if new_notes else existing_notes
+
+        existing_sources: list[SourceItem] = state.get("sources", []) or []
+        seen_urls = {s.get("url", "") for s in existing_sources}
+        for url in result.get("sources", []) or []:
+            if url not in seen_urls:
+                existing_sources.append(SourceItem(url=url, title="", content="", score=0.0))
+                seen_urls.add(url)
+        state["sources"] = existing_sources
+
+        # 记录委托
+        handoffs: list[dict] = state.get("agent_handoffs", []) or []
+        handoffs.append(AgentHandoff(
+            from_agent="planner",
+            to_agent="searchAgent",
+            instruction=instruction[:500],
+            result=result.get("summary", "")[:500],
+        ))
+        state["agent_handoffs"] = handoffs
+
+        return json.dumps({
+            "ok": result.get("ok", False),
+            "summary": result.get("summary", ""),
+            "sources_count": len(result.get("sources", []) or []),
+            "queries": result.get("queries", []) or [],
+        }, ensure_ascii=False)
+
+    return StructuredTool.from_function(
+        func=_call,
+        name="CallSearchAgent",
+        description=(
+            "将网络研究任务委托给 searchAgent。searchAgent 会使用搜索引擎查找信息并返回研究笔记。"
+            "参数: instruction (研究指令，描述需要搜索的内容和要回答的问题)。"
+        ),
+    )
 
 
-TodoWriteTool = StructuredTool.from_function(
-    func=_write_todos,
-    name="TodoWrite",
-    description=(
-        "向系统提交完整的执行计划。"
-        "参数: plan_summary (计划摘要), todos (待办列表, 每项含 id/content), "
-        "acceptance_criteria (验收标准列表), verification_commands (验证命令列表)。"
-    ),
-)
+def _make_call_code_agent_tool(state: MokioGraphState, writer) -> StructuredTool:
+    """创建 CallCodeAgentTool —— 委托实现任务给 codeAgent。"""
 
+    def _call(instruction: str) -> str:
+        """委托实现任务给 codeAgent。
 
-def _update_todo(id: str, status: str, note: str = "") -> str:
-    """No-op stub: the Actor node tracks status changes via tool-call args."""
-    return f"Todo {id} → {status}" + (f": {note}" if note else "")
+        Args:
+            instruction: 实现指令，包含完整上下文（任务、计划、todos、研究笔记等）。
 
+        Returns:
+            代码实现结果摘要 JSON 字符串。
+        """
+        runtime: RuntimeState = state["runtime"]
 
-TodoUpdateTool = StructuredTool.from_function(
-    func=_update_todo,
-    name="TodoUpdate",
-    description=(
-        "更新某个 todo 的执行状态。"
-        "参数: id (todo ID), status (pending|in_progress|completed|blocked), "
-        "note (可选, 执行笔记)。"
-    ),
-)
+        # 发射 handoff 事件
+        event = {"type": "handoff", "from": "planner", "to": "codeAgent", "instruction": instruction[:500]}
+        if writer is not None:
+            writer(event)
 
+        result = run_code_agent(runtime, instruction, writer=writer)
 
-def _report_verification(
-    passed: bool,
-    reason: str,
-    checks: list[dict],
-    recommended_next_instruction: str,
-) -> str:
-    """No-op stub: the Verifier node extracts structured results from the tool-call args."""
-    status = "通过" if passed else "未通过"
-    return f"验证{status}: {reason}"
+        # 更新 state 中的 code_agent_summary
+        state["code_agent_summary"] = result.get("summary", "")
 
+        # 收集 todos 更新
+        agent_todos: list[dict] = result.get("todos", []) or []
+        existing_todos: list[dict] = state.get("todos", []) or []
+        for ut in agent_todos:
+            tid = ut.get("id", "")
+            status = ut.get("status", "")
+            note = ut.get("note", "")
+            for t in existing_todos:
+                if t.get("id") == tid:
+                    t["status"] = status
+                    if note:
+                        t["note"] = note
+                    break
+        state["todos"] = existing_todos
 
-ReportVerificationTool = StructuredTool.from_function(
-    func=_report_verification,
-    name="ReportVerification",
-    description=(
-        "提交验证报告。"
-        "参数: passed (bool, 是否全部通过), reason (总结原因), "
-        "checks (列表, 每项含 name/passed/detail), "
-        "recommended_next_instruction (如未通过, 给 Planner 的具体修订建议)。"
-    ),
-)
+        # 记录委托
+        handoffs: list[dict] = state.get("agent_handoffs", []) or []
+        handoffs.append(AgentHandoff(
+            from_agent="planner",
+            to_agent="codeAgent",
+            instruction=instruction[:500],
+            result=result.get("summary", "")[:500],
+        ))
+        state["agent_handoffs"] = handoffs
+
+        return json.dumps({
+            "ok": result.get("ok", False),
+            "summary": result.get("summary", ""),
+            "todos_updated": len(agent_todos),
+        }, ensure_ascii=False)
+
+    return StructuredTool.from_function(
+        func=_call,
+        name="CallCodeAgent",
+        description=(
+            "将代码实现任务委托给 codeAgent。codeAgent 会在 workspace 中使用文件/Shell 工具完成实现。"
+            "参数: instruction (实现指令，应包含任务描述、计划摘要、todos、研究笔记等完整上下文)。"
+        ),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -98,17 +176,7 @@ ReportVerificationTool = StructuredTool.from_function(
 # ═══════════════════════════════════════════════════════════════════════
 
 def _extract_tool_call(messages: list, tool_name: str) -> dict | None:
-    """从消息列表中提取最后一个指定工具的调用参数。
-
-    倒序遍历消息列表，找到第一个 AIMessage 中匹配 tool_name 的 tool_call。
-
-    Args:
-        messages: LLM 对话消息列表。
-        tool_name: 要查找的工具名称。
-
-    Returns:
-        工具调用参数字典，未找到则返回 None。
-    """
+    """从消息列表中提取最后一个指定工具的调用参数。"""
     for msg in reversed(messages):
         if not isinstance(msg, AIMessage):
             continue
@@ -120,19 +188,25 @@ def _extract_tool_call(messages: list, tool_name: str) -> dict | None:
     return None
 
 
+def _extract_all_tool_calls(messages: list, tool_name: str) -> list[dict]:
+    """从消息列表中提取所有指定工具的调用参数（按时间顺序）。"""
+    results: list[dict] = []
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            continue
+        if not msg.tool_calls:
+            continue
+        for tc in msg.tool_calls:
+            if tc["name"] == tool_name:
+                results.append(tc["args"])
+    return results
+
+
 def _run_verification_commands(
     commands: list[str],
     workspace,
 ) -> list[VerificationResult]:
-    """在 workspace 中依次执行验证命令，收集结果。
-
-    Args:
-        commands: 命令字符串列表（如 ["pytest", "mypy src/"]）。
-        workspace: 工作区路径（Path 对象）。
-
-    Returns:
-        VerificationResult 列表，每个命令一条记录。
-    """
+    """在 workspace 中依次执行验证命令，收集结果。"""
     results: list[VerificationResult] = []
     for cmd in commands:
         try:
@@ -141,25 +215,27 @@ def _run_verification_commands(
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
                 cwd=str(workspace),
             )
             ok = proc.returncode == 0
             exit_code = proc.returncode
-            stdout = proc.stdout
-            stderr = proc.stderr
+            stdout = (proc.stdout or "")[:8000]
+            stderr = (proc.stderr or "")[:8000]
         except subprocess.TimeoutExpired:
             ok = False
             exit_code = None
             stdout = ""
-            stderr = f"命令超时 (120s): {cmd}"
+            stderr = f"命令超时 (120s): {cmd}"[:8000]
 
         results.append(VerificationResult(
             command=cmd,
             ok=ok,
             exit_code=exit_code,
-            stdout=stdout[:8000],   # 截断防止 token 爆炸
-            stderr=stderr[:8000],
+            stdout=stdout,
+            stderr=stderr,
         ))
     return results
 
@@ -193,41 +269,91 @@ def _format_verification_results(results: list[VerificationResult]) -> str:
     return "\n".join(lines)
 
 
-def _run_react_loop(
-    llm,
-    messages: list,
-    tool_map: dict[str, object],
-    max_loops: int = 10,
-) -> tuple[list, str]:
-    """执行 ReAct 循环：LLM 推理 ↔ 工具调用交替，直到完成或达到上限。
+def _format_sources(sources: list[SourceItem]) -> str:
+    """将来源列表格式化为可读文本。"""
+    if not sources:
+        return "(暂无来源)"
+    lines = []
+    for s in sources[:10]:
+        url = s.get("url", "")
+        title = s.get("title", "") or url
+        lines.append(f"  - [{title}]({url})")
+    return "\n".join(lines)
 
-    Args:
-        llm: 已绑定工具的模型实例。
-        messages: 初始消息列表（会在循环中追加）。
-        tool_map: 工具名 → 工具实例的映射。
-        max_loops: 最大推理轮数。
+
+# ═══════════════════════════════════════════════════════════════════════
+# Core nodes
+# ═══════════════════════════════════════════════════════════════════════
+
+def planner_node(state: MokioGraphState, *, writer=None) -> dict:
+    """Planner 节点：单阶段执行 —— TodoWrite + CallSearchAgent + CallCodeAgent 同时可用.
+
+    LLM 自由决定工具调用顺序：
+        1. 先用 TodoWrite 发布/修订执行计划.
+        2. 如需搜索，用 CallSearchAgent 委托 searchAgent.
+        3. 用 CallCodeAgent 委托 codeAgent 实现.
+
+    首次调用（无 todos）：生成计划 → 搜索（如需）→ 委托实现.
+    修订调用（verifier 失败后）：修订计划 → 仅委托修复.
 
     Returns:
-        (messages, last_ai_content): 更新后的完整消息列表和最终 AI 文本内容。
+        dict: 包含 plan_summary / todos / acceptance_criteria /
+              verification_commands / research_notes / sources /
+              agent_handoffs / code_agent_summary / messages 的状态更新.
     """
-    last_ai_content = ""
+    runtime: RuntimeState = state["runtime"]
+    llm = create_model(model=runtime.model, temperature=0.0)
 
-    for _ in range(max_loops):
-        response = llm.invoke(messages)
+    # 创建委托工具（需要 state + writer 闭包）
+    call_search = _make_call_search_agent_tool(state, writer)
+    call_code = _make_call_code_agent_tool(state, writer)
+
+    tools = [TodoWriteTool, call_search, call_code]
+    tool_map = {"TodoWrite": TodoWriteTool, "CallSearchAgent": call_search, "CallCodeAgent": call_code}
+
+    agent = llm.bind_tools(tools)
+
+    existing_todos = state.get("todos", [])
+    last_error = state.get("last_error", "")
+    research_notes = state.get("research_notes", "")
+
+    # ── 构建消息 ──
+    if not existing_todos:
+        plan_context = (
+            f"## 用户任务\n{state['task']}\n\n"
+            f"请先用 TodoWrite 发布执行计划，然后根据需要调用 CallSearchAgent 搜索信息，"
+            f"最后调用 CallCodeAgent 委托实现。"
+        )
+    else:
+        plan_context = (
+            f"## 原始任务\n{state['task']}\n\n"
+            f"## 当前计划\n{_format_todos(existing_todos)}\n\n"
+            f"## 验收标准\n" + "\n".join(f"  - {c}" for c in state.get("acceptance_criteria", [])) + "\n\n"
+            f"## 研究笔记\n{research_notes or '(无)'}\n\n"
+            f"## 上次验证失败\n{last_error}\n\n"
+            f"请先用 TodoWrite 修订计划，然后调用 CallCodeAgent 委托修复。"
+        )
+
+    system_msg = SystemMessage(content=PLANNER_PROMPT)
+    user_msg = HumanMessage(content=plan_context)
+    messages: list = [system_msg, user_msg]
+
+    # ── 单阶段工具循环：TodoWrite / CallSearchAgent / CallCodeAgent 同时可用 ──
+    max_loops = max(10, len(existing_todos) * 2 + 4)
+    for _loop in range(max_loops):
+        response = agent.invoke(messages)
         messages.append(response)
 
-        content = response.content or ""
-        if content:
-            last_ai_content = content
-
-        # 没有工具调用 → LLM 认为任务完成
         if not response.tool_calls:
             break
 
-        # 逐个执行工具调用
         for tool_call in response.tool_calls:
             tool_name: str = tool_call["name"]
             tool_args: dict = tool_call["args"]
+
+            # 发射事件
+            if writer is not None:
+                writer({"type": "tool_call", "node": "planner", "tool": tool_name, "args": tool_args})
 
             tool = tool_map.get(tool_name)
             if tool is not None:
@@ -239,155 +365,14 @@ def _run_react_loop(
                 result = f"错误: 未找到工具 '{tool_name}'"
 
             result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-
             messages.append(ToolMessage(
                 content=result_str,
                 tool_call_id=tool_call["id"],
             ))
 
-    return messages, last_ai_content
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Core nodes
-# ═══════════════════════════════════════════════════════════════════════
-
-def planner_node(state: MokioGraphState) -> dict:
-    """Planner 节点：生成或修订执行计划。
-
-    首次调用（无 todos）：
-        根据 state["task"] 生成新计划，LLM 通过 TodoWriteTool 返回结构化数据。
-    修订调用（verifier 失败后）：
-        根据 state["last_error"] 修订现有计划，保留已完成项，重新规划剩余工作。
-
-    Returns:
-        dict: 包含 plan_summary / todos / acceptance_criteria / verification_commands 的状态更新。
-    """
-    runtime: RuntimeState = state["runtime"]
-    llm = create_model(model=runtime.model, temperature=0.0)
-    agent = llm.bind_tools([TodoWriteTool])
-
-    existing_todos = state.get("todos", [])
-    last_error = state.get("last_error", "")
-
-    # 区分首次规划 vs 修订
-    if not existing_todos:
-        # ── 首次规划 ──
-        system_msg = SystemMessage(content=PLANNER_PROMPT)
-        user_msg = HumanMessage(content=f"请为以下任务创建执行计划:\n\n{state['task']}")
-        messages = [system_msg, user_msg]
-    else:
-        # ── 修订计划 ──
-        plan_context = (
-            f"## 原始任务\n{state['task']}\n\n"
-            f"## 当前计划\n{_format_todos(existing_todos)}\n\n"
-            f"## 验收标准\n" + "\n".join(f"  - {c}" for c in state.get("acceptance_criteria", [])) + "\n\n"
-            f"## 上次验证失败\n{last_error}\n\n"
-            f"请修订计划，解决验证失败的问题。已完成（✅）的 todo 保留不变，"
-            f"为剩余工作添加新的 todo。调用 TodoWrite 工具提交修订后的完整计划。"
-        )
-        system_msg = SystemMessage(content=PLANNER_PROMPT)
-        user_msg = HumanMessage(content=plan_context)
-        messages = [system_msg, user_msg]
-
-    # 调用 LLM
-    response = agent.invoke(messages)
-
-    # 提取 TodoWrite 工具调用的参数
-    plan_args = _extract_tool_call([response], "TodoWrite")
-    if plan_args is None:
-        # LLM 可能直接文本输出（降级处理），尝试从 JSON 解析
-        content = response.content or ""
-        try:
-            plan_args = json.loads(content)
-        except json.JSONDecodeError:
-            return {
-                "plan_summary": content[:500],
-                "todos": existing_todos,
-            }
-
-    # 构造 TodoItem 列表
-    raw_todos: list[dict] = plan_args.get("todos", [])
-    todos: list[TodoItem] = []
-    for i, t in enumerate(raw_todos):
-        todos.append(TodoItem(
-            id=t.get("id", str(i + 1)),
-            content=t.get("content", str(t)),
-            status=t.get("status", "pending"),
-            note=t.get("note", ""),
-        ))
-
-    return {
-        "plan_summary": plan_args.get("plan_summary", ""),
-        "todos": todos,
-        "acceptance_criteria": plan_args.get("acceptance_criteria", []),
-        "verification_commands": plan_args.get("verification_commands", []),
-        "messages": [system_msg, user_msg, response],
-    }
-
-
-def actor_node(state: MokioGraphState) -> dict:
-    """Actor 节点：按计划执行 todos。
-
-    使用 ReAct 循环（最多 10 轮）让 LLM 交替推理和调用工具。
-    LLM 可以调用所有文件/bash/grep 工具，以及 TodoUpdate 来标记进度。
-
-    Returns:
-        dict: 包含 messages / last_actor_summary / todos 的状态更新。
-    """
-    runtime: RuntimeState = state["runtime"]
-    tools = build_tools(runtime) + [TodoUpdateTool]
-    tool_map: dict[str, object] = {t.name: t for t in tools}
-    llm = create_model(model=runtime.model, temperature=0.0)
-    agent = llm.bind_tools(tools)
-
-    # 构建输入消息
-    todos = state.get("todos", [])
-    last_error = state.get("last_error", "")
-
-    # 区分首次执行 vs 重试执行
-    if last_error or state.get("attempts", 0) > 0:
-        # ── 重试轮：强调上次漏了什么，只关注未完成的 todo ──
-        pending_todos = [t for t in todos if t.get("status") != "completed"]
-        plan_text = (
-            f"## 任务\n{state['task']}\n\n"
-            f"## 计划摘要\n{state.get('plan_summary', '')}\n\n"
-            f"## ⚠️ 这是重试轮！以下 todos 需要你真正完成\n"
-            f"{_format_todos(pending_todos) if pending_todos else _format_todos(todos)}\n\n"
-            f"## 上次验证失败的反馈\n{last_error}\n\n"
-            f"## 本次已完成的 todos（不要重复执行）\n"
-            + "\n".join(f"  ✅ [{t['id']}] {t['content']}" for t in todos if t.get("status") == "completed") + "\n\n"
-            f"**请集中精力完成上面 ⚠️ 标记的待办项。不要只读文件，要真正创建/修改它们。**"
-        )
-    else:
-        # ── 首次执行 ──
-        plan_text = (
-            f"## 任务\n{state['task']}\n\n"
-            f"## 计划摘要\n{state.get('plan_summary', '')}\n\n"
-            f"## 待办列表\n{_format_todos(todos)}\n\n"
-            f"请开始执行。每完成一个 todo 请用 TodoUpdate 更新状态。"
-        )
-
-    messages: list = [
-        SystemMessage(content=ACTOR_PROMPT),
-        HumanMessage(content=plan_text),
-    ]
-
-    # ReAct 循环
-    messages, last_summary = _run_react_loop(agent, messages, tool_map, max_loops=10)
-
-    # 从消息中提取 TodoUpdate 调用，更新 todos 状态
-    updated_todos = _apply_todo_updates(todos, messages)
-
-    return {
-        "messages": messages,
-        "last_actor_summary": last_summary,
-        "todos": updated_todos,
-    }
-
 
 def verifier_node(state: MokioGraphState) -> dict:
-    """Verifier 节点：检查 Actor 的成果是否满足验收标准。
+    """Verifier 节点：检查 codeAgent 的成果是否满足验收标准。
 
     步骤:
         1. 在 workspace 中运行 verification_commands，收集 VerificationResult。
@@ -409,13 +394,19 @@ def verifier_node(state: MokioGraphState) -> dict:
     verification_results = _run_verification_commands(commands, runtime.workspace)
 
     # 2. 构建验证上下文
+    code_summary = state.get("code_agent_summary", "")
+    research_notes = state.get("research_notes", "")
+    sources = state.get("sources", []) or []
+
     context = (
         f"## 原始任务\n{state['task']}\n\n"
         f"## 计划摘要\n{state.get('plan_summary', '')}\n\n"
         f"## 验收标准\n" + "\n".join(f"  {i+1}. {c}" for i, c in enumerate(state.get("acceptance_criteria", []))) + "\n\n"
-        f"## Actor 执行总结\n{state.get('last_actor_summary', '(无)')}\n\n"
+        f"## 研究笔记\n{research_notes or '(无)'}\n\n"
+        f"## 参考来源\n{_format_sources(sources)}\n\n"
+        f"## codeAgent 执行总结\n{code_summary or '(无)'}\n\n"
         f"## 验证命令执行结果\n{_format_verification_results(verification_results)}\n\n"
-        f"请逐项检查验收标准，检查 Actor 产出的文件，然后调用 ReportVerification 提交报告。"
+        f"请逐项检查验收标准，检查 codeAgent 产出的文件，然后调用 ReportVerification 提交报告。"
     )
 
     messages = [
@@ -424,12 +415,36 @@ def verifier_node(state: MokioGraphState) -> dict:
     ]
 
     # 3. LLM 验证（只读工具循环）
-    messages, _ = _run_react_loop(agent, messages, tool_map, max_loops=8)
+    for _loop in range(8):
+        response = agent.invoke(messages)
+        messages.append(response)
+
+        if not response.tool_calls:
+            break
+
+        for tool_call in response.tool_calls:
+            tool_name: str = tool_call["name"]
+            tool_args: dict = tool_call["args"]
+
+            tool = tool_map.get(tool_name)
+            if tool is not None:
+                try:
+                    result = tool.invoke(tool_args)
+                except Exception as exc:
+                    result = f"工具执行异常: {exc}"
+            else:
+                result = f"错误: 未找到工具 '{tool_name}'"
+
+            result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+
+            messages.append(ToolMessage(
+                content=result_str,
+                tool_call_id=tool_call["id"],
+            ))
 
     # 4. 提取 ReportVerification 工具调用的参数
     report = _extract_tool_call(messages, "ReportVerification")
     if report is None:
-        # 降级：尝试从最后一个 AI 消息内容解析 JSON
         last_content = ""
         for msg in reversed(messages):
             if isinstance(msg, AIMessage) and msg.content:
@@ -453,7 +468,6 @@ def verifier_node(state: MokioGraphState) -> dict:
     # 5. 更新 state
     attempts = state.get("attempts", 0) + 1
 
-    # 构建 last_error（失败时）
     last_error = ""
     if not passed:
         failed_checks = [c for c in checks if not c.get("passed", True)]
@@ -464,7 +478,6 @@ def verifier_node(state: MokioGraphState) -> dict:
             f"建议: {next_instruction}"
         )
 
-    # 更新 todos 状态（根据验证结果标记）
     updated_todos = _mark_todos_from_verification(state.get("todos", []), checks, passed)
 
     return {
@@ -486,7 +499,7 @@ def verifier_route(state: MokioGraphState) -> str:
     """Verifier 之后的路由决策。
 
     Returns:
-        "final"  — 验证通过或已达最大尝试次数，结束执行。
+        "final"   — 验证通过或已达最大尝试次数，结束执行。
         "planner" — 验证未通过且还有重试空间，返回 Planner 修订计划。
     """
     if state.get("passed", False):
@@ -502,70 +515,16 @@ def verifier_route(state: MokioGraphState) -> str:
 # 内部辅助（节点实现细节）
 # ═══════════════════════════════════════════════════════════════════════
 
-def _apply_todo_updates(
-    todos: list[TodoItem],
-    messages: list,
-) -> list[TodoItem]:
-    """从消息历史中提取 TodoUpdate 调用并应用到 todos。
-
-    Args:
-        todos: 当前 todos 列表。
-        messages: ReAct 循环产生的完整消息列表。
-
-    Returns:
-        更新后的 todos 列表。
-    """
-    if not todos:
-        return todos
-
-    # 收集所有 TodoUpdate 调用（按时间顺序）
-    updates: dict[str, dict] = {}  # id → {status, note}
-    for msg in messages:
-        if not isinstance(msg, AIMessage):
-            continue
-        if not msg.tool_calls:
-            continue
-        for tc in msg.tool_calls:
-            if tc["name"] != "TodoUpdate":
-                continue
-            args = tc["args"]
-            tid = args.get("id", "")
-            updates[tid] = {
-                "status": args.get("status", "pending"),
-                "note": args.get("note", ""),
-            }
-
-    # 应用更新
-    updated: list[TodoItem] = []
-    for t in todos:
-        tid = t["id"]
-        if tid in updates:
-            updated.append(TodoItem(
-                id=t["id"],
-                content=t["content"],
-                status=updates[tid]["status"],
-                note=updates[tid]["note"] or t.get("note", ""),
-            ))
-        else:
-            updated.append(t)
-    return updated
-
-
 def _mark_todos_from_verification(
     todos: list[TodoItem],
     checks: list[dict],
     passed: bool,
 ) -> list[TodoItem]:
-    """根据验证结果更新 todos 状态。
-
-    全部通过 → 所有 todo 标记为 completed。
-    部分失败 → 相关 todo 标记为 blocked。
-    """
+    """根据验证结果更新 todos 状态。"""
     if not todos:
         return todos
 
     if passed:
-        # 全部标记为完成
         return [
             TodoItem(
                 id=t["id"],
@@ -576,7 +535,6 @@ def _mark_todos_from_verification(
             for t in todos
         ]
 
-    # 检查哪些 todo 对应的验证项失败了
     failed_names: set[str] = set()
     for c in checks:
         if not c.get("passed", True):

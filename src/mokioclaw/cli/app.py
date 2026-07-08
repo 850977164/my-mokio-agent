@@ -14,8 +14,6 @@ import typer
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
 
 from mokioclaw.core.agent import stream_agent_events
 from mokioclaw.core.paths import ensure_workspace, resolve_workspace
@@ -75,9 +73,7 @@ def main(
         border_style="cyan",
     ))
 
-    # 遍历 Plan & Execute 事件流
-    attempt_count = 0
-
+    # 遍历 MultiAgent 事件流
     for event in stream_agent_events(
         task,
         workspace=ws_path,
@@ -88,9 +84,6 @@ def main(
 
         if event_type == "planner":
             _display_planner(event)
-
-        elif event_type == "actor":
-            _display_actor(event)
 
         elif event_type == "verifier":
             _display_verifier(event)
@@ -145,38 +138,6 @@ def _display_planner(event: dict) -> None:
         "\n".join(content_lines),
         title="📋 Planner",
         border_style="blue",
-    ))
-
-
-def _display_actor(event: dict) -> None:
-    """渲染 Actor 节点产出：执行总结 + 更新后的 todo 状态."""
-    last_summary = event.get("last_actor_summary", "")
-    todos: list[dict] = event.get("todos", [])
-
-    # ── 统计 ──
-    total = len(todos)
-    completed = sum(1 for t in todos if t.get("status") == "completed")
-    blocked = sum(1 for t in todos if t.get("status") == "blocked")
-    in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
-    pending = sum(1 for t in todos if t.get("status") == "pending")
-
-    stats = f"完成 {completed}/{total}"
-    if blocked:
-        stats += f"  [red]受阻 {blocked}[/]"
-    if in_progress:
-        stats += f"  [yellow]进行中 {in_progress}[/]"
-    if pending:
-        stats += f"  [dim]待办 {pending}[/]"
-
-    content_lines = [stats, ""]
-    if last_summary:
-        content_lines.append(last_summary)
-
-    console.print()
-    console.print(Panel(
-        "\n".join(content_lines),
-        title="🔧 Actor",
-        border_style="green",
     ))
 
 
