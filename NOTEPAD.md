@@ -13,3 +13,8 @@
 - `hello.py` — the hello world script
 - `run.py` — Flask app entry point
 - `app/` — main Flask application
+
+## Task (session a8bcc9f9, turn 23): 验证 hello.py
+- 检查 hello.py: 文件存在，代码正确。
+- 运行结果: `python hello.py` → "Hello, World!", exit code 0。
+- 验收通过: 输出与退出码均符合预期。
