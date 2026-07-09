@@ -33,3 +33,8 @@
 - 覆盖 hello.py 为简洁版：`print("Hello, World!")`
 - 运行结果: `python hello.py` → "Hello, World!", exit code 0。
 - 验收通过: 输出与退出码均符合预期。
+
+## Task (session 9fadfa9f, turn 3): 验证 hello.py
+- 检查 hello.py: 文件存在，代码正确。
+- 运行结果: `python hello.py` → "Hello, World!", exit code 0。
+- 验收通过: 输出与退出码均符合预期。
