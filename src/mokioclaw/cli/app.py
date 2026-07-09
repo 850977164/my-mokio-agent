@@ -4,11 +4,15 @@
     mokioclaw "帮我重构这个模块" --workspace /path/to/project
     mokioclaw "检查代码质量" --workspace ./my-project --model gpt-4o
     mokioclaw "写个测试" --workspace ./src --max-attempts 5
+    mokioclaw "搭建项目" --approval-mode auto --checkpoint-mode strict --trace-mode on
+    mokioclaw --resume /path/to/checkpoint "继续之前的任务"
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from typing import Annotated, Literal
 
 import typer
 from dotenv import load_dotenv
@@ -27,28 +31,26 @@ app = typer.Typer(
     help="MokioClaw 智能调度代理 — 在指定工作区执行 AI 辅助开发任务",
 )
 
+Option = typer.Option
+
 
 @app.command()
 def main(
-    task: str = typer.Argument(..., help="任务描述，用自然语言告诉代理你要做什么"),
-    workspace: str | None = typer.Option(
-        None,
-        "--workspace",
-        "-w",
-        help="工作区路径，默认为当前目录下的 .mokioclaw/workspaces/default",
-    ),
-    model: str | None = typer.Option(
-        None,
-        "--model",
-        "-m",
-        help="模型名称，默认从环境变量 MODEL 读取，回退到 gpt-4o",
-    ),
-    max_attempts: int = typer.Option(
-        3,
-        "--max-attempts",
-        "-a",
-        help="最大重试次数，默认 3 次。验证失败后会返回 Planner 修订计划重试",
-    ),
+        ctx: typer.Context,
+        task: Annotated[str, typer.Argument(help="任务描述，用自然语言告诉代理你要做什么")],
+        workspace: Annotated[Path | None, Option("--workspace", "-w",
+                                                 help="工作区路径，默认为当前目录下的 .mokioclaw/workspaces/default")] = None,
+        model: Annotated[
+            str | None, Option("--model", "-m", help="模型名称，默认从环境变量 MODEL 读取，回退到 gpt-4o")] = None,
+        max_attempts: Annotated[int, Option("--max-attempts", "-a",
+                                            help="最大重试次数，默认 3 次。验证失败后会返回 Planner 修订计划重试")] = 3,
+        approval_mode: Annotated[Literal["inline", "auto", "deny"], Option("--approval-mode",
+                                                                           help="审批模式: inline (交互审批) | auto (自动放行) | deny (禁止风险命令)")] = "inline",
+        checkpoint_mode: Annotated[Literal["light", "strict", "off"], Option("--checkpoint-mode",
+                                                                             help="检查点模式: light (节点切换时保存) | strict (每个事件都保存) | off (不保存)")] = "light",
+        trace_mode: Annotated[
+            Literal["on", "off"], Option("--trace-mode", help="追踪模式: on (记录执行追踪) | off (不记录)")] = "on",
+        resume: Annotated[Path | None, Option("--resume", help="从指定检查点工作区恢复运行")] = None,
 ) -> None:
     """启动 MokioClaw 代理执行任务。
 
@@ -56,43 +58,52 @@ def main(
         mokioclaw "阅读 README.md 并总结"
         mokioclaw "找出所有 TODO 注释" --workspace ./src
         mokioclaw "写测试" --workspace ./src --max-attempts 5
+        mokioclaw "搭建项目" --approval-mode auto --checkpoint-mode strict
+        mokioclaw --resume ./project "继续之前的任务"
     """
     # 解析模型名：CLI 参数 > 环境变量 MODEL > 默认 gpt-4o
     if model is None:
         model = os.getenv("MODEL", "gpt-4o")
-    ws_path = resolve_workspace(workspace)
+
+    # 解析工作区
+    ws_path = resolve_workspace(str(workspace) if workspace else None)
     ws_path = ensure_workspace(ws_path)
+
+    # 解析恢复路径
+    resume_path = resume.resolve() if resume else None
 
     console.print(Panel.fit(
         f"[bold cyan]🚀 MokioClaw v0.1.0[/]\n"
-        f"📂 workspace:   {ws_path}\n"
-        f"🤖 model:       {model}\n"
-        f"🔁 max attempts: {max_attempts}\n"
-        f"📋 task:        {task}",
+        f"📂 workspace:        {ws_path}\n"
+        f"🤖 model:            {model}\n"
+        f"🔁 max attempts:     {max_attempts}\n"
+        f"🔐 approval mode:    {approval_mode}\n"
+        f"💾 checkpoint mode:  {checkpoint_mode}\n"
+        f"🔍 trace mode:       {trace_mode}\n"
+        f"📋 task:             {task}"
+        + (f"\n🔄 resume from:      {resume_path}" if resume_path else ""),
         title="MokioClaw",
         border_style="cyan",
     ))
 
     # 遍历 MultiAgent 事件流
     for event in stream_agent_events(
-        task,
-        workspace=ws_path,
-        max_attempts=max_attempts,
-        model=model,
+            task,
+            workspace=ws_path,
+            max_attempts=max_attempts,
+            model=model,
+            approval_mode=approval_mode,
+            checkpoint_mode=checkpoint_mode,
+            resume_workspace=resume_path,
+            trace_mode=trace_mode,
     ):
         event_type = event["type"]
 
-        if event_type == "planner":
-            _display_planner(event)
+        if event_type == "graph_event":
+            _display_graph_event(event["event"])
 
-        elif event_type == "verifier":
-            _display_verifier(event)
-
-        elif event_type == "final":
-            _display_final(event)
-
-        elif event_type == "custom":
-            # 透传的自定义事件，暂不处理
+        elif event_type == "custom_event":
+            # 透传的自定义事件，暂不渲染
             pass
 
     console.print()
@@ -101,6 +112,18 @@ def main(
 # ═══════════════════════════════════════════════════════════════════════════
 # 各节点输出渲染
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _display_graph_event(event: dict) -> None:
+    """分发 graph_event 到正确的渲染函数."""
+    for node_name, node_output in event.items():
+        if node_name == "planner":
+            _display_planner(node_output)
+        elif node_name == "verifier":
+            _display_verifier(node_output)
+        elif node_name == "final":
+            _display_final(node_output)
+        # context_monitor / context_compressor 等节点不渲染
+
 
 def _display_planner(event: dict) -> None:
     """渲染 Planner 节点产出：计划摘要 + todo 列表."""

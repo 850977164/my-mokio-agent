@@ -29,7 +29,11 @@ def build_tools(state: RuntimeState) -> list[StructuredTool]:
         create_file_write_tool(workspace=workspace),
         create_file_edit_tool(workspace=workspace),
         create_grep_tool(workspace=workspace),
-        create_bash_tool(workspace=workspace),
+        create_bash_tool(
+            workspace=workspace,
+            approval_mode=state.approval_mode,
+            approval_handler=state.approval_handler,
+        ),
     ]
 
 
