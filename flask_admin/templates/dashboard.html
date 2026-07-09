@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+
+{% block title %}仪表盘 - Flask 后台管理系统{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <!-- 欢迎语 -->
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2><i class="bi bi-grid-1x2-fill"></i> 仪表盘</h2>
+        <span class="text-muted">欢迎回来，{{ current_user.username }}！</span>
+    </div>
+
+    <!-- 统计卡片 -->
+    <div class="row g-4 mb-4">
+        <div class="col-md-3">
+            <div class="card border-0 shadow-sm bg-primary text-white">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <h6 class="card-subtitle mb-1 opacity-75">总用户数</h6>
+                            <h3 class="card-title mb-0">{{ stats.total_users }}</h3>
+                        </div>
+                        <i class="bi bi-people" style="font-size: 2rem; opacity: 0.5;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card border-0 shadow-sm bg-success text-white">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <h6 class="card-subtitle mb-1 opacity-75">活跃会话</h6>
+                            <h3 class="card-title mb-0">{{ stats.active_sessions }}</h3>
+                        </div>
+                        <i class="bi bi-activity" style="font-size: 2rem; opacity: 0.5;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card border-0 shadow-sm bg-warning text-white">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <h6 class="card-subtitle mb-1 opacity-75">今日访问</h6>
+                            <h3 class="card-title mb-0">{{ stats.daily_visits }}</h3>
+                        </div>
+                        <i class="bi bi-graph-up" style="font-size: 2rem; opacity: 0.5;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card border-0 shadow-sm bg-info text-white">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <h6 class="card-subtitle mb-1 opacity-75">月收入</h6>
+                            <h3 class="card-title mb-0">{{ stats.monthly_revenue }}</h3>
+                        </div>
+                        <i class="bi bi-cash-stack" style="font-size: 2rem; opacity: 0.5;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 用户信息卡片 -->
+    <div class="row g-4">
+        <div class="col-md-6">
+            <div class="card border-0 shadow-sm">
+                <div class="card-header bg-white border-bottom">
+                    <h5 class="mb-0"><i class="bi bi-person-badge"></i> 账户信息</h5>
+                </div>
+                <div class="card-body">
+                    <table class="table table-borderless mb-0">
+                        <tbody>
+                            <tr>
+                                <td class="text-muted" style="width: 80px;">用户名</td>
+                                <td><strong>{{ current_user.username }}</strong></td>
+                            </tr>
+                            <tr>
+                                <td class="text-muted">邮箱</td>
+                                <td>{{ current_user.email }}</td>
+                            </tr>
+                            <tr>
+                                <td class="text-muted">注册时间</td>
+                                <td>{{ current_user.created_at.strftime('%Y-%m-%d %H:%M') if current_user.created_at else 'N/A' }}</td>
+                            </tr>
+                            <tr>
+                                <td class="text-muted">用户 ID</td>
+                                <td><span class="badge bg-secondary">#{{ current_user.id }}</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card border-0 shadow-sm">
+                <div class="card-header bg-white border-bottom">
+                    <h5 class="mb-0"><i class="bi bi-bar-chart-line"></i> 快速操作</h5>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted">系统运行状态良好。以下是一些快速操作入口：</p>
+                    <div class="d-grid gap-2">
+                        <button class="btn btn-outline-primary" disabled>
+                            <i class="bi bi-person-plus"></i> 添加用户（即将上线）
+                        </button>
+                        <button class="btn btn-outline-secondary" disabled>
+                            <i class="bi bi-gear"></i> 系统设置（即将上线）
+                        </button>
+                        <button class="btn btn-outline-info" disabled>
+                            <i class="bi bi-file-earmark-bar-graph"></i> 查看报表（即将上线）
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

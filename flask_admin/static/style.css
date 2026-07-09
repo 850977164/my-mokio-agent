@@ -1,0 +1,83 @@
+/* 全局样式 */
+body {
+    background-color: #f5f6fa;
+    min-height: 100vh;
+}
+
+/* 导航栏 */
+.navbar {
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.navbar-brand {
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+
+/* 卡片增强 */
+.card {
+    border-radius: 0.5rem;
+    transition: transform 0.2s ease;
+}
+
+.card:hover {
+    transform: translateY(-2px);
+}
+
+/* 统计卡片不需要 hover 效果 */
+.bg-primary.card:hover,
+.bg-success.card:hover,
+.bg-warning.card:hover,
+.bg-info.card:hover {
+    transform: none;
+}
+
+/* 闪存消息 */
+.alert {
+    border-radius: 0.4rem;
+    border: none;
+}
+
+/* 表单 */
+.form-control:focus {
+    border-color: #6c63ff;
+    box-shadow: 0 0 0 0.2rem rgba(108, 99, 255, 0.25);
+}
+
+.input-group-text {
+    background-color: #f8f9fa;
+}
+
+.btn-primary {
+    background-color: #6c63ff;
+    border-color: #6c63ff;
+}
+
+.btn-primary:hover {
+    background-color: #5a52d5;
+    border-color: #5a52d5;
+}
+
+.btn-outline-primary {
+    color: #6c63ff;
+    border-color: #6c63ff;
+}
+
+.btn-outline-primary:hover {
+    background-color: #6c63ff;
+    border-color: #6c63ff;
+}
+
+/* 首页特色卡片 */
+.card .bi {
+    transition: transform 0.3s ease;
+}
+
+.card:hover .bi {
+    transform: scale(1.1);
+}
+
+/* Footer (如有) */
+footer {
+    margin-top: auto;
+}

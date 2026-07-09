@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}用户管理{% endblock %}
+
+{% block content %}
+<div class="users-management">
+    <h2>用户管理</h2>
+    <p>共 {{ users|length }} 个用户</p>
+    <table class="table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>用户名</th>
+                <th>邮箱</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for user in users %}
+            <tr>
+                <td>{{ user.id }}</td>
+                <td>{{ user.username }}</td>
+                <td>{{ user.email }}</td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="3">暂无用户数据</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

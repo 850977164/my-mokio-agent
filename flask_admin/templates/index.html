@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block title %}首页 - Flask 后台管理系统{% endblock %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-8 text-center">
+            <h1 class="display-4 mb-4">欢迎使用 Flask 后台管理系统</h1>
+            <p class="lead text-muted mb-4">
+                一个基于 Flask 的轻量级后台管理系统，包含完整的用户认证功能。
+            </p>
+            <div class="d-flex justify-content-center gap-3">
+                {% if current_user.is_authenticated %}
+                    <a href="{{ url_for('main.dashboard') }}" class="btn btn-primary btn-lg">
+                        <i class="bi bi-grid-1x2-fill"></i> 进入仪表盘
+                    </a>
+                {% else %}
+                    <a href="{{ url_for('auth.login') }}" class="btn btn-primary btn-lg">
+                        <i class="bi bi-box-arrow-in-right"></i> 登录
+                    </a>
+                    <a href="{{ url_for('auth.register') }}" class="btn btn-outline-primary btn-lg">
+                        <i class="bi bi-person-plus"></i> 注册
+                    </a>
+                {% endif %}
+            </div>
+            <hr class="my-5">
+            <div class="row g-4">
+                <div class="col-md-4">
+                    <div class="card border-0 shadow-sm h-100">
+                        <div class="card-body text-center">
+                            <i class="bi bi-shield-lock text-primary" style="font-size: 2rem;"></i>
+                            <h5 class="card-title mt-2">安全认证</h5>
+                            <p class="card-text text-muted">密码哈希存储，Session 安全的用户认证系统。</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card border-0 shadow-sm h-100">
+                        <div class="card-body text-center">
+                            <i class="bi bi-speedometer text-primary" style="font-size: 2rem;"></i>
+                            <h5 class="card-title mt-2">仪表盘</h5>
+                            <p class="card-text text-muted">直观的数据面板，展示关键业务指标。</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card border-0 shadow-sm h-100">
+                        <div class="card-body text-center">
+                            <i class="bi bi-bootstrap-reboot text-primary" style="font-size: 2rem;"></i>
+                            <h5 class="card-title mt-2">现代UI</h5>
+                            <p class="card-text text-muted">基于 Bootstrap 5 的响应式界面设计。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
