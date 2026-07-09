@@ -563,6 +563,7 @@ def verifier_node(state: MokioGraphState) -> dict:
         "last_error": last_error,
         "todos": updated_todos,
         "messages": messages,
+        "context_next_node": "planner" if not passed else "verifier",
     }
 
 
@@ -649,6 +650,12 @@ def context_monitor_route(state: MokioGraphState) -> str:
     """
     if state.get("passed"):
         return "final"
+
+    attempts = state.get("attempts", 0)
+    max_attempts = state.get("max_attempts", 3)
+    if attempts >= max_attempts:
+        return "final"
+
     if state.get("context_should_compress"):
         return "context_compressor"
     return state.get("context_next_node", "verifier")
