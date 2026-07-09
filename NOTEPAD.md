@@ -28,3 +28,8 @@
 - 检查 hello.py: 文件存在，代码正确（经典 Hello World 实现）。
 - 运行结果: `python hello.py` → "Hello, World!", exit code 0。
 - 验收通过: 输出与退出码均符合预期。
+
+## Task (session 1bc4719d, turn 0): 创建 hello.py
+- 覆盖 hello.py 为简洁版：`print("Hello, World!")`
+- 运行结果: `python hello.py` → "Hello, World!", exit code 0。
+- 验收通过: 输出与退出码均符合预期。
