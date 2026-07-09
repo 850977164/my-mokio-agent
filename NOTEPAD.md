@@ -23,3 +23,8 @@
 - 确认工作区文件结构完整：hello.py、run.py、app/、flask_admin/、tests/、project/ 等均存在。
 - 运行 `python hello.py` → "Hello, World!", exit code 0。
 - 验收通过：输出与退出码均符合预期。
+
+## Task (session 048c766d, turn 0): 验证 hello.py
+- 检查 hello.py: 文件存在，代码正确（经典 Hello World 实现）。
+- 运行结果: `python hello.py` → "Hello, World!", exit code 0。
+- 验收通过: 输出与退出码均符合预期。
