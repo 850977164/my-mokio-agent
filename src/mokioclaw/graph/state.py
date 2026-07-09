@@ -190,3 +190,10 @@ class MokioGraphState(TypedDict, total=False):
 
     risks: str
     """已知风险与阻塞项，从压缩摘要中提取."""
+
+    last_user_input: str
+    session_context: str
+    intent_route: str
+    intent_reason: str
+    intent_confidence: float
+    chat_response: str

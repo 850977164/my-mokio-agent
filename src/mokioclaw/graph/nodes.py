@@ -45,7 +45,10 @@ from mokioclaw.graph.memory import (
     format_layered_memory_for_prompt,
     memory_event,
 )
-from mokioclaw.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
+from mokioclaw.prompts.stage3 import (
+    PLANNER_PROMPT, VERIFIER_PROMPT,
+    INTENT_ROUTER_PROMPT, CHAT_RESPONDER_PROMPT,
+)
 from mokioclaw.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools.registry import build_read_only_tools
@@ -879,3 +882,51 @@ def _mark_todos_from_verification(
         else:
             updated.append(t)
     return updated
+
+def intent_router_node(state):
+    runtime = state["runtime"]
+    llm = create_model(model=runtime.model, temperature=0.0)
+    user_input = state.get("last_user_input", "") or state.get("task", "")
+    session_ctx = state.get("session_context", "")
+    sep = chr(10)  # newline
+    prompt_parts = [INTENT_ROUTER_PROMPT]
+    if session_ctx:
+        prompt_parts.append(sep + "--- Session Context ---" + sep + session_ctx[:3000])
+    prompt_parts.append(sep + "--- Latest User Input ---" + sep + user_input)
+    messages = [HumanMessage(content="".join(prompt_parts))]
+    try:
+        response = llm.invoke(messages)
+        raw = (response.content or "").strip()
+        if raw.startswith("```"):
+            lines = raw.split(sep)
+            lines = [l for l in lines if not l.startswith("```")]
+            raw = sep.join(lines).strip()
+        result = json.loads(raw)
+        route = result.get("route", "workflow")
+        reason = result.get("reason", "")
+        confidence = float(result.get("confidence", 0.0))
+        if route not in ("chat", "workflow"):
+            route, reason, confidence = "workflow", "invalid route", 0.0
+        if confidence < 0.55:
+            route, reason, confidence = "workflow", "low confidence", 0.0
+    except (json.JSONDecodeError, ValueError, KeyError):
+        route, reason, confidence = "workflow", "parse failed", 0.0
+    return {"intent_route": route, "intent_reason": reason, "intent_confidence": confidence}
+
+def chat_responder_node(state):
+    runtime = state["runtime"]
+    llm = create_model(model=runtime.model, temperature=0.3)
+    user_input = state.get("last_user_input", "") or state.get("task", "")
+    session_ctx = state.get("session_context", "")
+    sep = chr(10)
+    prompt_parts = [CHAT_RESPONDER_PROMPT]
+    if session_ctx:
+        prompt_parts.append(sep + "--- Session Context ---" + sep + session_ctx[:3000])
+    prompt_parts.append(sep + "--- User Message ---" + sep + user_input)
+    messages = [HumanMessage(content="".join(prompt_parts))]
+    response = llm.invoke(messages)
+    chat_reply = (response.content or "").strip()
+    return {"chat_response": chat_reply, "final_answer": chat_reply}
+
+def intent_route_fn(state):
+    return "chat_responder" if state.get("intent_route") == "chat" else "planner"

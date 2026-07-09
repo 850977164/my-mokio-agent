@@ -25,6 +25,9 @@ from mokioclaw.graph.nodes import (
     context_monitor_route,
     context_compressor_node,
     context_compressor_route,
+    intent_router_node,
+    chat_responder_node,
+    intent_route_fn,
 )
 from mokioclaw.graph.state import MokioGraphState
 
@@ -230,4 +233,14 @@ def build_complex_workflow():
     graph.add_edge("verifier", "context_monitor")  # 验证后也过 monitor
     graph.add_edge("final", END)
 
+    return graph.compile()
+
+
+def build_entry_workflow():
+    graph = StateGraph(MokioGraphState)
+    graph.add_node("intent_router", intent_router_node)
+    graph.add_node("chat_responder", chat_responder_node)
+    graph.add_edge(START, "intent_router")
+    graph.add_conditional_edges("intent_router", intent_route_fn, {"chat_responder": "chat_responder", "planner": END})
+    graph.add_edge("chat_responder", END)
     return graph.compile()
